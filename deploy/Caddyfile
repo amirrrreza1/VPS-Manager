@@ -1,0 +1,38 @@
+# Caddy reverse proxy for VPS Manager.
+#
+# Caddy obtains and renews TLS automatically. Copy to /etc/caddy/Caddyfile and
+# set your domain. The panel should NEVER be exposed over plain HTTP.
+
+manager.example.com {
+	encode zstd gzip
+
+	# The app sets its own security headers; these are the network-level
+	# backstops in case the app is unreachable.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# No request body larger than 25 MB (matches VPM_MAX_UPLOAD_BYTES).
+	request_body {
+		max_size 25MB
+	}
+
+	reverse_proxy 127.0.0.1:3000 {
+		# Deploy logs stream over SSE; buffering would hold them until the
+		# deploy finishes, which defeats the live log view.
+		flush_interval -1
+		transport http {
+			read_timeout 30m
+			write_timeout 30m
+		}
+	}
+
+	log {
+		output file /var/log/caddy/vps-manager.log
+		format json
+	}
+}

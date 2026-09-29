@@ -1,0 +1,22 @@
+# VPS Manager - least-privilege sudo rules
+#
+# The app runs as an unprivileged user and needs exactly one thing it cannot do
+# itself: talk to the Docker daemon. Rather than running the app as root (or
+# adding it to the `docker` group, which is root-equivalent by design), grant
+# sudo for a fixed set of compose subcommands.
+#
+# Install:  visudo -f /etc/sudoers.d/vps-manager
+#
+# NOTE: `docker-compose` is still effectively root-equivalent, because compose
+# can mount any host path into a container. This narrows the blast radius to
+# "the app can restart/inspect your declared stacks" rather than "the app is
+# root", and it keeps a path-traversal bug from becoming a shell.
+
+# Replace `vpm` with the user that runs the app (vpm in the Dockerfile).
+Cmnd_Alias VPM_COMPOSE = /usr/bin/docker compose -f *, \
+                       /usr/bin/docker compose *, \
+                       /usr/bin/docker compose version, \
+                       /usr/bin/docker compose ls, \
+                       /usr/bin/docker info
+
+vpm ALL=(root) NOPASSWD: VPM_COMPOSE

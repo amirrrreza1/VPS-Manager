@@ -39,3 +39,13 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# vps-manager local state
+# The SQLite DB holds password hashes, TOTP secrets and session records.
+/.vpm-data/
+# Local sandbox used when developing off-target (VPM_ROOTS default on win32).
+/.dev-root/
+# Stray test output
+/deploy-out.log
+# Editor backups created by the Files API
+*.bak
