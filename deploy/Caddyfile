@@ -21,9 +21,6 @@ atlas.amirrrreza.ir {
 		max_size 1GB
 	}
 
-	# Download URLs contain bearer tokens. Do not persist them in access logs.
-	log_skip /api/shared/*
-
 	# Matches the loopback port published by deploy/compose.yaml.
 	# For the systemd example in README.md, use port 3000 instead.
 	reverse_proxy 127.0.0.1:3090 {
@@ -38,6 +35,14 @@ atlas.amirrrreza.ir {
 
 	log {
 		output file /var/log/caddy/vps-manager.log
-		format json
+		# Compatible with the VPS's Caddy 2.6.2: retain access events while
+		# removing bearer URLs and potentially sensitive referring URLs.
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp "^/api/shared/.*$" "/api/shared/[redacted]"
+				request>headers>Referer delete
+			}
+		}
 	}
 }

@@ -154,8 +154,9 @@ Back up personal files along with the SQLite database; they are separate from
 your project repositories.
 
 When upgrading, rebuild/restart the panel and apply the updated Caddy site block:
-it permits 1 GiB uploads and excludes `/api/shared/*` from access logging using
-[Caddy's `log_skip` directive](https://caddyserver.com/docs/caddyfile/directives/log_skip).
+it permits 1 GiB uploads and redacts `/api/shared/*` URLs from access logging using
+[Caddy's log filters](https://caddyserver.com/docs/caddyfile/directives/log#filter),
+which are supported by the VPS's Caddy 2.6.2. Referring URLs are also removed.
 Validate Caddy before reloading. Other reverse proxies, CDNs and monitoring
 systems must also omit or redact bearer URLs. The app audits share IDs without
 recording tokens. Keep the Next.js port on loopback behind your HTTPS proxy.
