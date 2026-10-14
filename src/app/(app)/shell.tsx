@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 
 const NAV = [
   { href: "/dashboard", label: "Projects" },
+  { href: "/server", label: "Server" },
   { href: "/files", label: "Files" },
   { href: "/activity", label: "Activity" },
   { href: "/settings", label: "Settings" },
@@ -23,13 +24,13 @@ export default function Shell({ children, username }: { children: React.ReactNod
   return (
     <div className="flex min-h-screen flex-col">
       <header className="sticky top-0 z-10 border-b border-zinc-800 bg-zinc-950/90 backdrop-blur">
-        <div className="mx-auto flex h-14 max-w-7xl items-center gap-6 px-4">
+        <div className="mx-auto flex min-h-14 max-w-7xl flex-wrap items-center gap-2 px-4 py-2 sm:gap-6">
           <Link href="/dashboard" className="flex items-center gap-2 font-semibold">
             <span className="text-emerald-500">⬢</span>
             <span className="hidden sm:inline">VPS Manager</span>
           </Link>
 
-          <nav className="flex flex-1 items-center gap-1">
+          <nav className="order-3 flex w-full items-center gap-1 overflow-x-auto sm:order-none sm:w-auto sm:flex-1">
             {NAV.map((item) => {
               const active = pathname === item.href || pathname.startsWith(item.href + "/");
               return (
@@ -48,7 +49,7 @@ export default function Shell({ children, username }: { children: React.ReactNod
             })}
           </nav>
 
-          <div className="flex items-center gap-3">
+          <div className="ml-auto flex items-center gap-3">
             <span className="hidden text-sm text-zinc-500 sm:inline">{username}</span>
             <button
               onClick={logout}

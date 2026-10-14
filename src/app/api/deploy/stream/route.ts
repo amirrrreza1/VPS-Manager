@@ -16,6 +16,7 @@ export async function GET(req: Request) {
   if (!initial) return new Response("deploy not found", { status: 404 });
 
   const encoder = new TextEncoder();
+  let cancelStream = () => {};
 
   const stream = new ReadableStream({
     start(controller) {
@@ -37,6 +38,7 @@ export async function GET(req: Request) {
         closed = true;
         clearInterval(ping);
         deployEvents.off(`update:${id}`, onUpdate);
+        req.signal.removeEventListener("abort", cleanup);
         try {
           controller.close();
         } catch {
@@ -56,9 +58,11 @@ export async function GET(req: Request) {
       const ping = setInterval(() => send("ping", { t: Date.now() }), 15_000);
 
       req.signal.addEventListener("abort", cleanup);
-
-      send("deploy", initial);
+      cancelStream = cleanup;
+      onUpdate(initial);
+      if (req.signal.aborted) cleanup();
     },
+    cancel() { cancelStream(); },
   });
 
   return new Response(stream, {

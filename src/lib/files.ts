@@ -13,7 +13,8 @@ import {
 } from "./safe-path";
 import { MAX_EDIT_BYTES, MAX_UPLOAD_BYTES, SECRET_FILE_PATTERNS, EDITABLE_EXTENSIONS } from "./config";
 import { audit } from "./audit";
-import { envRoots } from "./roots";
+import { fileRoots, personalFilesRoot } from "./roots";
+import { inspectMedia } from "./media";
 
 /**
  * File read/write. All operations resolve through safe-path.ts first, so the
@@ -24,10 +25,12 @@ import { envRoots } from "./roots";
  */
 
 export function isSecretFile(name: string): boolean {
-  return SECRET_FILE_PATTERNS.some((re) => re.test(path.basename(name)));
+  const base = path.basename(name).replace(/\.\d+(?:-[a-f0-9]+)?\.bak$/i, "");
+  return SECRET_FILE_PATTERNS.some((re) => re.test(base));
 }
 
 export function isEditable(name: string): boolean {
+  if (isSecretFile(name)) return true;
   const ext = path.extname(name).toLowerCase();
   if (EDITABLE_EXTENSIONS.has(ext)) return true;
   // Extensionless files that are conventionally config/text
@@ -70,7 +73,7 @@ export function redactContent(text: string): { text: string; redacted: boolean }
     const value = m[2];
     if (value === "" || value.startsWith("#")) return line;
     // Only mask plausible secret values.
-    if (value.length < 8) return line;
+    if (value.length < 8 && !/password|secret|token|key/i.test(key)) return line;
     if (/^(https?:\/\/localhost|127\.0\.0\.1)/.test(value) && !/password|secret|token|key/i.test(key)) {
       return line;
     }
@@ -98,7 +101,8 @@ export function readFileSafe(filePath: string, opts: { reveal?: boolean } = {}):
   let content = binary ? "" : buf.toString("utf8");
   let redacted = false;
   if (!opts.reveal && isSecretFile(name)) {
-    const r = redactContent(content);
+    const envLike = /(?:^\.env(?:\..+)?$|\.env$)/i.test(name.replace(/\.\d+(?:-[a-f0-9]+)?\.bak$/i, ""));
+    const r = envLike ? redactContent(content) : { text: "[Secret file hidden — reveal values to view or edit]", redacted: true };
     content = r.text;
     redacted = r.redacted;
   }
@@ -125,6 +129,7 @@ export interface WriteResult {
   path: string;
   bytes: number;
   backupPath: string | null;
+  mtimeMs: number;
 }
 
 /**
@@ -140,7 +145,7 @@ function assertNotMasked(absPath: string, content: string): void {
   const masked = content
     .split("\n")
     .some((line) => /^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*\*{4,}/.test(line));
-  if (masked) {
+  if (masked || content.includes("[Secret file hidden — reveal values to view or edit]")) {
     throw new PathError(
       "refusing to write masked secret values - open the file with reveal enabled first",
       400,
@@ -152,6 +157,7 @@ export function writeFileSafe(
   filePath: string,
   content: string,
   meta: { user: string; ip: string },
+  expectedMtimeMs?: number,
 ): WriteResult {
   const abs = resolveForWrite(filePath);
   if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
@@ -163,19 +169,22 @@ export function writeFileSafe(
     throw new PathError(`content is ${formatBytes(bytes)} - exceeds edit limit`, 413);
   }
   assertNotMasked(abs, content);
+  if (expectedMtimeMs !== undefined && (!fs.existsSync(abs) || fs.statSync(abs).mtimeMs !== expectedMtimeMs)) {
+    throw new PathError("file changed on disk; reopen it before saving", 409);
+  }
 
   let backupPath: string | null = null;
   if (fs.existsSync(abs)) {
     const st = fs.statSync(abs);
-    const bak = `${abs}.${Date.now()}.bak`;
+    const bak = `${abs}.${Date.now()}-${crypto.randomBytes(3).toString("hex")}.bak`;
     fs.copyFileSync(abs, bak);
     backupPath = toDisplayPath(bak);
-    void st;
+    fs.chmodSync(bak, st.mode);
   }
 
   // Atomic write.
   const tmp = `${abs}.tmp-${crypto.randomBytes(6).toString("hex")}`;
-  fs.writeFileSync(tmp, content, "utf8");
+  fs.writeFileSync(tmp, content, { encoding: "utf8", mode: fs.existsSync(abs) ? fs.statSync(abs).mode : 0o600 });
   try {
     fs.renameSync(tmp, abs);
   } catch (err) {
@@ -193,7 +202,7 @@ export function writeFileSafe(
     detail: { bytes, backup: backupPath },
   });
 
-  return { path: toDisplayPath(abs), bytes, backupPath };
+  return { path: toDisplayPath(abs), bytes, backupPath, mtimeMs: fs.statSync(abs).mtimeMs };
 }
 
 export function createFile(
@@ -230,9 +239,14 @@ export function renameEntry(
 ): { path: string } {
   assertSafeName(newName);
   const from = resolveSafe(oldPath, undefined, { mustExist: true });
+  assertMutableEntry(oldPath, from);
   const parent = resolveDir(path.dirname(from));
   const to = path.join(parent, newName);
-  if (fs.existsSync(to)) throw new PathError("a file with that name already exists", 409);
+  if (from === to) return { path: toDisplayPath(from) };
+  // On case-insensitive filesystems the new spelling resolves to the source.
+  const caseOnlyRename = path.basename(from).toLowerCase() === newName.toLowerCase()
+    && fs.existsSync(to) && fs.realpathSync.native(from) === fs.realpathSync.native(to);
+  if (fs.existsSync(to) && !caseOnlyRename) throw new PathError("a file with that name already exists", 409);
   fs.renameSync(from, to);
   audit({
     user: meta.user,
@@ -251,6 +265,7 @@ export function deleteEntry(
   const abs = resolveSafe(targetPath, undefined, { mustExist: true });
   const root = path.parse(abs).root;
   if (abs === root) throw new PathError("refusing to delete a filesystem root", 400);
+  assertMutableEntry(targetPath, abs);
   const st = fs.lstatSync(abs);
   fs.rmSync(abs, { recursive: st.isDirectory(), force: false });
   audit({
@@ -261,6 +276,21 @@ export function deleteEntry(
     detail: { type: st.isDirectory() ? "dir" : "file" },
   });
   return { path: toDisplayPath(abs) };
+}
+
+function assertMutableEntry(input: string, resolved: string): void {
+  for (const root of fileRoots()) {
+    let realRoot: string;
+    try { realRoot = fs.realpathSync.native(root); } catch { continue; }
+    const relative = path.relative(resolved, realRoot);
+    if (relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))) {
+      throw new PathError("refusing to mutate a configured root or its parent", 400);
+    }
+  }
+  // Resolve the parent separately so these operations never delete a link's target.
+  const parent = resolveDir(path.dirname(input));
+  const lexical = path.join(parent, path.basename(input));
+  if (fs.lstatSync(lexical).isSymbolicLink()) throw new PathError("renaming or deleting symlinks is not supported", 400);
 }
 
 export function uploadFile(
@@ -274,7 +304,7 @@ export function uploadFile(
   const dir = resolveDir(dirPath);
   const target = path.join(dir, name);
   if (fs.existsSync(target)) throw new PathError("already exists", 409);
-  fs.writeFileSync(target, data);
+  fs.writeFileSync(target, data, { flag: "wx", mode: 0o600 });
   audit({
     user: meta.user,
     ip: meta.ip,
@@ -282,7 +312,7 @@ export function uploadFile(
     target: toDisplayPath(target),
     detail: { bytes: data.length },
   });
-  return { path: toDisplayPath(target), bytes: data.length, backupPath: null };
+  return { path: toDisplayPath(target), bytes: data.length, backupPath: null, mtimeMs: fs.statSync(target).mtimeMs };
 }
 
 export function listDirectory(dirPath: string) {
@@ -290,6 +320,7 @@ export function listDirectory(dirPath: string) {
   return {
     path: toDisplayPath(abs),
     parent: (() => {
+      try { if (abs === fs.realpathSync.native(personalFilesRoot())) return null; } catch { /* not created yet */ }
       const p = path.dirname(abs);
       try {
         resolveDir(p);
@@ -335,7 +366,7 @@ export function searchFiles(
       const nameHit = e.name.toLowerCase().includes(needle);
       const lineMatches: { line: number; text: string }[] = [];
 
-      if (opts.content && isEditable(e.name)) {
+      if (opts.content && isEditable(e.name) && !isSecretFile(e.name)) {
         try {
           const st = fs.statSync(full);
           if (st.size > 512 * 1024) continue;
@@ -361,7 +392,7 @@ export function searchFiles(
   if (startDirs.length > 0) {
     for (const d of startDirs) walk(d, 0);
   } else {
-    for (const r of envRoots()) {
+    for (const r of fileRoots()) {
       try {
         walk(resolveDir(r), 0);
       } catch {
@@ -373,7 +404,7 @@ export function searchFiles(
   return results;
 }
 
-function assertSafeName(name: string): void {
+export function assertSafeName(name: string): void {
   if (typeof name !== "string" || name.length === 0 || name.length > 255) {
     throw new PathError("invalid name");
   }
@@ -382,6 +413,23 @@ function assertSafeName(name: string): void {
   }
   if (name === "." || name === "..") throw new PathError("invalid name");
   if (/[<>:"|?*]/.test(name)) throw new PathError("name contains illegal characters");
+  if (/[\x00-\x1f\x7f]/.test(name) || name.startsWith(".vpm-upload-")) throw new PathError("invalid name");
+}
+
+export function ensurePersonalStorage(): void {
+  fs.mkdirSync(personalFilesRoot(), { recursive: true, mode: 0o700 });
+}
+
+export function fileInfo(filePath: string) {
+  const abs = resolveFile(filePath);
+  const stat = fs.statSync(abs);
+  if (!stat.isFile()) throw new PathError("not a regular file", 400);
+  const name = path.basename(abs);
+  return {
+    path: toDisplayPath(abs), name, size: stat.size, mtimeMs: stat.mtimeMs,
+    editable: isEditable(name), previewAvailable: isEditable(name) && stat.size <= MAX_EDIT_BYTES,
+    mediaPreview: isSecretFile(name) ? null : inspectMedia(abs),
+  };
 }
 
 export function formatBytes(n: number): string {

@@ -36,7 +36,7 @@ export async function GET(req: Request) {
       commitBefore: row.commit_before,
       commitAfter: row.commit_after,
       steps: row.log ? JSON.parse(row.log) : [],
-      error: null,
+      error: row.error,
     });
   }
 
@@ -58,9 +58,10 @@ export async function POST(req: Request) {
 
   // A second deploy of the same project is refused - concurrent compose runs
   // on one directory corrupt state.
-  const running = listActiveDeploys().find(
-    (d) => d.absPath === projectPath || d.project === projectPath.replace(/^\/+/, ""),
-  );
+  let resolved: string;
+  try { resolved = resolveDir(projectPath); }
+  catch (err) { return fail((err as Error).message, err instanceof PathError ? err.status : 400); }
+  const running = listActiveDeploys().find((d) => d.absPath === resolved);
   if (running) return fail(`a deploy is already running for ${running.project}`, 409);
 
   const opts: DeployOptions = {
@@ -76,8 +77,7 @@ export async function POST(req: Request) {
   };
 
   try {
-    resolveDir(projectPath);
-    const handle = startDeploy(projectPath, opts, {
+    const handle = startDeploy(resolved, opts, {
       user: auth.user.username,
       ip: auth.meta.ip,
     });
@@ -89,7 +89,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, id: handle.id });
   } catch (err) {
     if (err instanceof PathError) return fail(err.message, err.status);
-    return fail((err as Error).message, 500);
+    return fail((err as Error).message, 400);
   }
 }
 

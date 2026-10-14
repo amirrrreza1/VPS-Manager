@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { ServerOverview } from "../server/server-overview";
 
 interface Project {
   name: string;
@@ -33,6 +34,10 @@ interface Capabilities {
   freeMem: number;
 }
 
+interface DeployRecord {
+  id: string; project: string; status: string; started_at: number; branch: string | null;
+}
+
 export default function DashboardPage() {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [caps, setCaps] = useState<Capabilities | null>(null);
@@ -40,6 +45,9 @@ export default function DashboardPage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [deployId, setDeployId] = useState<string | null>(null);
   const [logs, setLogs] = useState<{ label: string; status: string; output: string }[]>([]);
+  const [history, setHistory] = useState<DeployRecord[]>([]);
+  const [result, setResult] = useState<string | null>(null);
+  const [containerOutput, setContainerOutput] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -48,7 +56,10 @@ export default function DashboardPage() {
       if (!res.ok) throw new Error(data.error);
       setProjects(data.projects);
       setCaps(data.capabilities);
-      setError(null);
+      setHistory(data.history ?? []);
+      if (data.active?.length) {
+        setDeployId(data.active[0].id); setBusy(data.active[0].project);
+      }
     } catch (e) {
       setError((e as Error).message);
       setProjects([]);
@@ -67,8 +78,10 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!deployId) return;
     const es = new EventSource(`/api/deploy/stream?id=${encodeURIComponent(deployId)}`);
-    es.addEventListener("deploy", (e) => {
-      const state = JSON.parse((e as MessageEvent).data);
+    let poll: ReturnType<typeof setInterval> | undefined;
+    let disposed = false;
+    const update = (state: { status: string; error?: string; steps?: { label: string; status: string; output: string }[] }) => {
+      if (disposed) return;
       setLogs(
         (state.steps ?? []).map((s: { label: string; status: string; output: string }) => ({
           label: s.label,
@@ -78,27 +91,41 @@ export default function DashboardPage() {
       );
       if (state.status !== "running" && state.status !== "queued") {
         es.close();
+        if (poll) clearInterval(poll);
         setBusy(null);
         setDeployId(null);
+        setResult(state.status);
+        if (state.error) setError(state.error);
         void load();
       }
-    });
+    };
+    es.addEventListener("deploy", (e) => update(JSON.parse((e as MessageEvent).data)));
     es.onerror = () => {
       es.close();
-      setBusy(null);
-      setDeployId(null);
+      const refresh = async () => {
+        try {
+          const response = await fetch(`/api/deploy?id=${encodeURIComponent(deployId)}`);
+          const state = await response.json();
+          if (!response.ok) throw new Error(state.error ?? "Could not read deploy status");
+          update(state);
+        } catch (e) { if (!disposed) setError((e as Error).message); }
+      };
+      poll = setInterval(() => void refresh(), 3000);
+      void refresh();
     };
-    return () => es.close();
+    return () => { disposed = true; es.close(); if (poll) clearInterval(poll); };
   }, [deployId, load]);
 
   async function deploy(p: Project) {
+    if (p.dirty && !confirm(`Deploy ${p.name}? This discards uncommitted changes in the project.`)) return;
     setBusy(p.name);
     setLogs([]);
+    setResult(null); setError(null);
     try {
       const res = await fetch("/api/deploy", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project: p.path, build: true, autoRollback: true }),
+        body: JSON.stringify({ project: p.path, build: true, autoRollback: true, healthTimeoutSec: 60 }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -111,6 +138,33 @@ export default function DashboardPage() {
       setError("failed to start deploy");
       setBusy(null);
     }
+  }
+
+  async function inspect(p: Project, action: "ps" | "logs") {
+    setContainerOutput(`Loading ${action} for ${p.name}…`);
+    try {
+      const response = await fetch(`/api/docker?project=${encodeURIComponent(p.path)}&action=${action}`);
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.error ?? "Docker inspection failed");
+      setContainerOutput(data.output || "No containers or output.");
+    } catch (e) { setContainerOutput((e as Error).message); }
+  }
+
+  async function viewHistory(id: string) {
+    try {
+      const response = await fetch(`/api/deploy?id=${encodeURIComponent(id)}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error);
+      setLogs(data.steps ?? []); setResult(data.status);
+    } catch (e) { setError((e as Error).message); }
+  }
+
+  async function abort() {
+    if (!deployId) return;
+    const response = await fetch(`/api/deploy?id=${encodeURIComponent(deployId)}`, { method: "DELETE" });
+    const data = await response.json();
+    if (!response.ok) setError(data.error);
+    else setResult("Abort requested; waiting for the current command to finish.");
   }
 
   if (error && projects === null) {
@@ -133,6 +187,10 @@ export default function DashboardPage() {
           Refresh
         </button>
       </div>
+
+      {error && <p role="alert" className="rounded-lg border border-red-900 bg-red-950/40 p-3 text-sm text-red-300">{error}</p>}
+      {result && <p role="status" className="text-sm text-zinc-300">Deploy: {result.replaceAll("_", " ")}</p>}
+      <ServerOverview />
 
       {caps && !caps.dockerCompose && (
         <div className="rounded-lg border border-amber-900 bg-amber-950/30 p-3 text-sm text-amber-300">
@@ -193,6 +251,10 @@ export default function DashboardPage() {
               </div>
 
               <div className="flex shrink-0 items-center gap-2">
+                {p.composeFile && <>
+                  <button onClick={() => inspect(p, "ps")} className="text-xs text-zinc-400">Containers</button>
+                  <button onClick={() => inspect(p, "logs")} className="text-xs text-zinc-400">Logs</button>
+                </>}
                 <Link
                   href={`/files?path=${encodeURIComponent(p.path)}`}
                   className="rounded-lg border border-zinc-800 px-3 py-1.5 text-sm text-zinc-400 transition hover:border-zinc-700 hover:text-zinc-200"
@@ -201,7 +263,7 @@ export default function DashboardPage() {
                 </Link>
                 <button
                   onClick={() => deploy(p)}
-                  disabled={busy === p.name || busy !== null}
+                  disabled={busy !== null || !p.composeFile || !caps?.dockerCompose}
                   className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-emerald-500 disabled:opacity-40"
                 >
                   {busy === p.name ? "Deploying…" : "Deploy"}
@@ -217,6 +279,7 @@ export default function DashboardPage() {
           <div className="border-b border-zinc-800 px-4 py-2 text-sm font-medium">
             Deploy output
             {busy && <span className="ml-2 text-emerald-400">● running</span>}
+            {deployId && <button onClick={abort} className="ml-3 text-xs text-red-400">Abort deploy</button>}
           </div>
           <div className="divide-y divide-zinc-900">
             {logs.map((l, i) => (
@@ -232,17 +295,17 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {caps && (
-        <div className="grid grid-cols-2 gap-3 text-xs text-zinc-500 sm:grid-cols-4">
-          <Stat label="Host" value={caps.host} />
-          <Stat label="Uptime" value={formatUptime(caps.uptimeSec)} />
-          <Stat
-            label="Memory"
-            value={`${Math.round(caps.freeMem / 1024 ** 3)}/${Math.round(caps.totalMem / 1024 ** 3)} GB`}
-          />
-          <Stat label="Load" value={caps.loadavg.map((n) => n.toFixed(2)).join(" ")} />
-        </div>
-      )}
+      {containerOutput !== null && <section className="rounded-xl border border-zinc-800 p-4">
+        <div className="flex justify-between text-sm"><h2>Container output</h2><button onClick={() => setContainerOutput(null)} className="text-zinc-500">Close</button></div>
+        <pre className="deploy-log mt-3 max-h-80 overflow-auto text-zinc-400">{containerOutput}</pre>
+      </section>}
+      {history.length > 0 && <section className="rounded-xl border border-zinc-800 p-4">
+        <h2 className="mb-3 text-sm font-medium">Recent deployments</h2>
+        <div className="space-y-2">{history.map((record) => <button disabled={!!busy} onClick={() => viewHistory(record.id)} key={record.id} className="flex w-full flex-wrap gap-3 rounded bg-zinc-900 p-3 text-left text-xs disabled:opacity-40">
+          <span className="font-medium text-zinc-200">{record.project}</span><span className="text-zinc-400">{record.branch}</span><span className={record.status === "succeeded" ? "text-emerald-400" : "text-amber-400"}>{record.status.replaceAll("_", " ")}</span><time className="ml-auto text-zinc-500">{new Date(record.started_at).toLocaleString()}</time>
+        </button>)}</div>
+      </section>}
+
     </div>
   );
 }
@@ -252,21 +315,4 @@ function StatusDot({ status }: { status: string }) {
   if (status === "failed") return <span className="text-red-400">✕</span>;
   if (status === "running") return <span className="animate-pulse-dot text-sky-400">●</span>;
   return <span className="text-zinc-600">○</span>;
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2">
-      <div className="text-zinc-600">{label}</div>
-      <div className="truncate font-mono text-zinc-300">{value}</div>
-    </div>
-  );
-}
-
-function formatUptime(sec: number): string {
-  const d = Math.floor(sec / 86400);
-  const h = Math.floor((sec % 86400) / 3600);
-  if (d > 0) return `${d}d ${h}h`;
-  const m = Math.floor((sec % 3600) / 60);
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }

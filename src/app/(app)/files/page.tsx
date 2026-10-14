@@ -1,26 +1,19 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import dynamic from "next/dynamic";
-import type { Extension } from "@codemirror/state";
-import { javascript } from "@codemirror/lang-javascript";
-import { json } from "@codemirror/lang-json";
-import { markdown } from "@codemirror/lang-markdown";
-import { css } from "@codemirror/lang-css";
-import { html } from "@codemirror/lang-html";
-import { oneDark } from "@codemirror/theme-one-dark";
+import { FileTree, type Entry } from "./file-tree";
+import { fileIcon, Icon } from "./file-icon";
+import { UploadPanel, bytesLabel } from "./upload-panel";
+import { SharePanel } from "./share-panel";
+import { MediaPreview } from "./media-preview";
+import type { MediaPreview as MediaFormat } from "@/lib/media";
 
-const CodeMirror = dynamic(() => import("@uiw/react-codemirror"), { ssr: false });
-
-interface Entry {
-  name: string;
-  type: "file" | "dir" | "symlink" | "other";
-  size: number;
-  mtimeMs: number;
-  escaping?: boolean;
-  broken?: boolean;
-}
+const FileEditor = dynamic(() => import("./file-editor"), {
+  ssr: false,
+  loading: () => <p role="status" className="p-6 text-sm text-zinc-500">Loading editor…</p>,
+});
 
 interface FileContent {
   path: string;
@@ -31,6 +24,8 @@ interface FileContent {
   redacted: boolean;
   binary: boolean;
   editable: boolean;
+  previewAvailable: boolean;
+  mediaPreview: MediaFormat | null;
 }
 
 interface SearchHit {
@@ -39,20 +34,12 @@ interface SearchHit {
   matches: { line: number; text: string }[];
 }
 
-function languageFor(name: string): Extension[] {
-  const ext = name.split(".").pop()?.toLowerCase() ?? "";
-  if (["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"].includes(ext))
-    return [javascript({ typescript: ext.includes("ts"), jsx: ext.includes("x") })];
-  if (["json", "jsonc"].includes(ext)) return [json()];
-  if (["md", "mdx"].includes(ext)) return [markdown()];
-  if (["css", "scss", "less"].includes(ext)) return [css()];
-  if (["html", "vue", "svg"].includes(ext)) return [html()];
-  return [];
-}
-
 export default function FilesPage() {
   const params = useSearchParams();
-  const [cwd, setCwd] = useState<string>(params.get("path") ?? "/");
+  const requestedPath = params.get("path") ?? "/@personal";
+  const [cwd, setCwd] = useState<string>(requestedPath);
+  const [browserPath, setBrowserPath] = useState<string>(requestedPath);
+  const [revision, setRevision] = useState(0);
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [parent, setParent] = useState<string | null>(null);
   const [file, setFile] = useState<FileContent | null>(null);
@@ -64,16 +51,25 @@ export default function FilesPage() {
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<SearchHit[] | null>(null);
-  const fileRef = useRef<FileContent | null>(null);
+  const [roots, setRoots] = useState<string[]>([]);
+  const [mutating, setMutating] = useState(false);
+  const [locations, setLocations] = useState<{ path: string; label: string }[]>([]);
+  const [uploadLimit, setUploadLimit] = useState(1024 ** 3);
+  const [shareTarget, setShareTarget] = useState<string | null | undefined>(undefined);
+  const dirtyRef = useRef(false);
 
-  const loadDir = useCallback(async (p: string) => {
+  const loadDir = useCallback(async (p: string, select = true) => {
     try {
       const res = await fetch(`/api/files?path=${encodeURIComponent(p)}`);
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      if (!res.ok) throw new Error(res.status === 401 ? "Session expired. Please sign in again." : data.error);
       setEntries(data.entries);
       setParent(data.parent);
-      setCwd(data.path);
+      if (select) { setCwd(data.path); setBrowserPath(data.path); }
+      setRevision((value) => value + 1);
+      setRoots(data.roots ?? []);
+      setLocations(data.locations ?? []);
+      setUploadLimit(data.limits?.uploadBytes ?? 1024 ** 3);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -82,17 +78,25 @@ export default function FilesPage() {
   }, []);
 
   const openFile = useCallback(async (p: string, reveal = false) => {
+    if (dirtyRef.current && !confirm("Discard unsaved changes?")) return;
     try {
-      const res = await fetch(
-        `/api/files?action=read&path=${encodeURIComponent(p)}${reveal ? "&reveal=1" : ""}`,
-      );
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      const infoRes = await fetch(`/api/files?action=info&path=${encodeURIComponent(p)}`);
+      const info = await infoRes.json();
+      if (!infoRes.ok) throw new Error(infoRes.status === 401 ? "Session expired. Please sign in again." : info.error);
+      let data: FileContent = { ...info, content: "", redacted: false, binary: false };
+      if (info.previewAvailable) {
+        const res = await fetch(`/api/files?action=read&path=${encodeURIComponent(p)}${reveal ? "&reveal=1" : ""}`);
+        const content = await res.json();
+        if (!res.ok) throw new Error(res.status === 401 ? "Session expired. Please sign in again." : content.error);
+        data = { ...content, previewAvailable: true, mediaPreview: info.mediaPreview };
+      }
       setFile(data);
-      fileRef.current = data;
+      setResults(null);
       setDraft(data.content);
       setDirty(false);
+      dirtyRef.current = false;
       setRevealed(reveal);
+      setStatus(null);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -104,8 +108,8 @@ export default function FilesPage() {
     // synchronously, so this does not cascade renders. The rule cannot see
     // through the async boundary.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    void loadDir(params.get("path") ?? "/");
-  }, [loadDir, params]);
+    void loadDir(requestedPath);
+  }, [loadDir, requestedPath]);
 
   // Warn before losing unsaved edits.
   useEffect(() => {
@@ -129,11 +133,12 @@ export default function FilesPage() {
       return;
     }
     setStatus("saving…");
+    setMutating(true);
     try {
       const res = await fetch("/api/files/mutate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ op: "write", path: file.path, content: draft }),
+        body: JSON.stringify({ op: "write", path: file.path, content: draft, expectedMtimeMs: file.mtimeMs }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
@@ -143,9 +148,15 @@ export default function FilesPage() {
           : `saved ${data.bytes} bytes`,
       );
       setDirty(false);
+      dirtyRef.current = false;
+      setFile({ ...file, content: draft, mtimeMs: data.mtimeMs, size: data.bytes });
+      setError(null);
+      void loadDir(browserPath, false);
     } catch (e) {
       setError((e as Error).message);
       setStatus(null);
+    } finally {
+      setMutating(false);
     }
   }
 
@@ -155,39 +166,74 @@ export default function FilesPage() {
     setSearching(true);
     try {
       const res = await fetch(
-        `/api/files/search?q=${encodeURIComponent(query)}&content=1&limit=40`,
+        `/api/files/search?q=${encodeURIComponent(query)}&content=1&limit=40&dir=${encodeURIComponent(browserPath)}`,
       );
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Search failed");
       setResults(data.results ?? []);
+    } catch (e) {
+      setError((e as Error).message);
     } finally {
       setSearching(false);
     }
   }
 
-  const extensions = useMemo(
-    () => (file ? languageFor(file.name) : []),
-    [file],
-  );
+  async function mutate(op: string, target?: string, name?: string) {
+    const affectsOpenFile = !!(target && file && (file.path === target || file.path.startsWith(`${target}/`)));
+    if (dirtyRef.current && affectsOpenFile && (op === "rename" || op === "delete") && !confirm("Discard unsaved changes?")) return;
+    if (op === "delete" && !confirm(`Delete ${target}? Directories and their contents will be removed.`)) return;
+    if (op !== "delete") {
+      name = prompt(op === "rename" ? "New name" : op === "createDir" ? "Folder name" : "File name", name ?? "") ?? undefined;
+      if (!name) return;
+    }
+    setMutating(true); setError(null);
+    try {
+      const res = await fetch("/api/files/mutate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ op, path: target, dir: cwd, name, content: "" }) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(res.status === 401 ? "Session expired. Please sign in again." : data.error ?? "Operation failed");
+      if ((op === "rename" || op === "delete") && affectsOpenFile) {
+        setFile(null); setDirty(false); dirtyRef.current = false;
+      }
+      if (target && (cwd === target || cwd.startsWith(`${target}/`))) {
+        setCwd(op === "rename" ? `${data.path}${cwd.slice(target.length)}` : browserPath);
+      }
+      await loadDir(browserPath, false);
+      if (op === "createFile") await openFile(data.path);
+      setStatus(`${op === "delete" ? "Deleted" : op === "rename" ? "Renamed" : "Created"} ${name ?? target}`);
+    } catch (e) { setError((e as Error).message); }
+    finally { setMutating(false); }
+  }
 
   return (
     <div className="space-y-4">
+      <div><h1 className="text-lg font-semibold">File manager</h1><p className="mt-1 text-sm text-zinc-500">Store personal files on your VPS, download them, and share expiring links.</p></div>
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <label>Location <select aria-label="File location" disabled={mutating} value={locations.find((location) => browserPath === location.path || (location.path !== "/" && browserPath.startsWith(`${location.path}/`)))?.path ?? (locations.some((location) => location.path === "/") && !browserPath.startsWith("/@personal") ? "/" : "")} onChange={(e) => { setResults(null); void loadDir(e.target.value); }} className="ml-2 max-w-64 rounded border border-zinc-700 bg-zinc-950 p-2"><option value="" disabled>Select location</option>{locations.map((location) => <option key={location.path} value={location.path}>{location.label}</option>)}</select></label>
+        <button disabled={mutating} onClick={() => mutate("createFile")} className="flex items-center gap-2 rounded-lg border border-zinc-700 px-3 py-2"><Icon name="file" />New file</button>
+        <button disabled={mutating} onClick={() => mutate("createDir")} className="flex items-center gap-2 rounded-lg border border-zinc-700 px-3 py-2"><Icon name="folder" />New folder</button>
+        <button onClick={() => setShareTarget(null)} className="flex items-center gap-2 rounded-lg border border-zinc-700 px-3 py-2"><Icon name="link" />Manage links</button>
+        {mutating && <span className="text-zinc-500">Working…</span>}
+      </div>
+      <UploadPanel dir={cwd} limit={uploadLimit} disabled={mutating || entries === null} onBusyChange={setMutating} onComplete={() => void loadDir(browserPath, false)} />
+      {shareTarget !== undefined && <SharePanel key={shareTarget ?? "all"} path={shareTarget} onClose={() => setShareTarget(undefined)} />}
+      {status && !file && <p role="status" className="text-sm text-emerald-400">{status}</p>}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold">Files</h1>
-          <p className="font-mono text-xs text-zinc-500">{cwd}</p>
+          <h2 className="text-sm font-semibold">{cwd.startsWith("/@personal") ? "Personal files" : "Project files"}</h2>
+          <p className="break-all text-xs text-zinc-500">Create and upload in <span className="font-mono text-zinc-400">{cwd}</span></p>
         </div>
         <form
           onSubmit={(e) => {
             e.preventDefault();
             void doSearch();
           }}
-          className="flex gap-2"
+          className="flex w-full min-w-0 gap-2 sm:w-auto"
         >
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="search names + content…"
-            className="w-64 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-sm outline-none focus:border-emerald-500"
+            className="min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-sm outline-none focus:border-emerald-500 sm:w-64"
           />
           <button
             type="submit"
@@ -211,7 +257,7 @@ export default function FilesPage() {
       </div>
 
       {error && (
-        <p className="rounded-lg border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+        <p role="alert" className="rounded-lg border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
           {error}
         </p>
       )}
@@ -225,8 +271,8 @@ export default function FilesPage() {
               onClick={() => openFile(r.path)}
               className="block w-full rounded-lg border border-zinc-800 bg-zinc-900/40 p-3 text-left transition hover:border-zinc-700"
             >
-              <div className="font-mono text-sm text-zinc-200">{r.name}</div>
-              <div className="font-mono text-xs text-zinc-500">{r.path}</div>
+              <div className="flex items-center gap-2 break-all font-mono text-sm text-zinc-200"><Icon name={fileIcon(r.name)} />{r.name}</div>
+              <div className="break-all font-mono text-xs text-zinc-500">{r.path}</div>
               {r.matches.slice(0, 3).map((m, i) => (
                 <div key={i} className="mt-1 truncate font-mono text-xs text-zinc-600">
                   {m.line}: {m.text.trim()}
@@ -236,49 +282,31 @@ export default function FilesPage() {
           ))}
         </div>
       ) : (
-        <div className="grid gap-4 lg:grid-cols-[280px_1fr]">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[400px_minmax(0,1fr)]">
           {/* ---- browser ---- */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40">
+          <div className="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/40">
             <div className="flex items-center gap-1 border-b border-zinc-800 p-2">
               <button
                 onClick={() => parent && loadDir(parent)}
-                disabled={!parent}
-                className="rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 disabled:opacity-30"
+                disabled={!parent || mutating}
+                aria-label="Browse parent folder"
+                title="Browse parent folder"
+                className="rounded p-2 text-zinc-400 hover:bg-zinc-800 disabled:opacity-30"
               >
-                ↑ up
+                <Icon name="up" />
               </button>
               <button
-                onClick={() => loadDir("/")}
-                className="rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800"
+                disabled={mutating}
+                onClick={() => loadDir(browserPath.startsWith("/@personal") ? "/@personal" : roots.length > 1 ? roots.find((root) => browserPath === root || browserPath.startsWith(`${root}/`)) ?? "/" : "/")}
+                className="flex items-center gap-2 rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800"
               >
-                root
+                <Icon name="folder" />Root
               </button>
+              <button disabled={mutating} onClick={() => setCwd(browserPath)} title="Select this folder for new files and uploads" className="min-w-0 flex-1 truncate px-2 text-left font-mono text-xs text-zinc-500">{browserPath}</button>
+              <button aria-label="Refresh files" title="Refresh files" onClick={() => loadDir(browserPath, false)} className="rounded p-2 text-zinc-400 hover:bg-zinc-800"><Icon name="refresh" /></button>
             </div>
-            <div className="max-h-[70vh] overflow-auto p-1">
-              {entries?.map((e) => {
-                const full = `${cwd === "/" ? "" : cwd}/${e.name}`;
-                const active = file?.path === full;
-                return (
-                  <button
-                    key={e.name}
-                    onClick={() => (e.type === "dir" ? loadDir(full) : openFile(full))}
-                    className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition ${
-                      active ? "bg-zinc-800 text-zinc-100" : "text-zinc-300 hover:bg-zinc-800/60"
-                    }`}
-                  >
-                    <span className="w-4 shrink-0 text-zinc-500">
-                      {e.type === "dir" ? "▸" : e.broken ? "⚠" : e.escaping ? "⚠" : "·"}
-                    </span>
-                    <span className="truncate">{e.name}</span>
-                    {e.escaping && <span className="ml-auto text-[10px] text-amber-500">symlink</span>}
-                    {e.type === "file" && (
-                      <span className="ml-auto text-[10px] text-zinc-600">
-                        {e.size < 1024 ? `${e.size}B` : `${(e.size / 1024).toFixed(1)}K`}
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
+            <div className="max-h-[70vh] overflow-auto">
+              <FileTree key={browserPath} rootPath={browserPath} entries={entries} selectedDirectory={cwd} selectedFile={file?.path} revision={revision} mutating={mutating} onDirectorySelect={setCwd} onFileSelect={(path) => void openFile(path)} onRename={(path, name) => void mutate("rename", path, name)} onDelete={(path) => void mutate("delete", path)} />
             </div>
           </div>
 
@@ -286,12 +314,12 @@ export default function FilesPage() {
           <div className="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/40">
             {!file ? (
               <p className="p-8 text-center text-sm text-zinc-500">
-                Select a file to edit it.
+                Select a picture or video to preview it, or a text file to edit it. You can also download files and create share links.
               </p>
             ) : (
               <>
                 <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800 p-3">
-                  <span className="font-mono text-sm text-zinc-200">{file.name}</span>
+                  <Icon name={fileIcon(file.name)} /><span title={file.path} className="break-all font-mono text-sm text-zinc-200">{file.name}</span>
                   {file.redacted && (
                     <span
                       className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400"
@@ -309,7 +337,8 @@ export default function FilesPage() {
                       unsaved
                     </span>
                   )}
-                  <div className="ml-auto flex items-center gap-2">
+                  <div className="ml-auto flex flex-wrap items-center gap-2">
+                    {file.path.startsWith("/@personal/") && <button disabled={dirty || mutating} title={dirty ? "Save your changes before sharing" : "Create an expiring download link"} onClick={() => setShareTarget(file.path)} className="rounded-lg border border-emerald-800 px-2.5 py-1 text-xs text-emerald-400 disabled:opacity-40">Share link</button>}
                     {file.redacted && !revealed && (
                       <button
                         onClick={() => openFile(file.path, true)}
@@ -324,10 +353,10 @@ export default function FilesPage() {
                     >
                       Download
                     </a>
-                    {file.editable && !file.binary && (
+                    {file.previewAvailable && file.editable && !file.binary && (
                       <button
                         onClick={save}
-                        disabled={!dirty || (file.redacted && !revealed)}
+                        disabled={!dirty || mutating || (file.redacted && !revealed)}
                         title={
                           file.redacted && !revealed
                             ? "Reveal values before saving"
@@ -342,21 +371,22 @@ export default function FilesPage() {
                 </div>
 
                 {status && <p className="px-3 py-1.5 text-xs text-emerald-400">{status}</p>}
+                <div className="flex flex-wrap gap-4 border-b border-zinc-800 px-3 py-2 text-xs text-zinc-500"><span>{bytesLabel(file.size)}</span><span>Modified {new Date(file.mtimeMs).toLocaleString()}</span></div>
 
-                {file.binary ? (
+                {file.mediaPreview ? <MediaPreview key={`${file.path}-${file.mtimeMs}-${file.size}`} path={file.path} name={file.name} mtimeMs={file.mtimeMs} size={file.size} media={file.mediaPreview} /> : !file.previewAvailable ? <div className="space-y-2 p-8 text-center"><Icon name={fileIcon(file.name)} className="mx-auto h-12 w-12 text-zinc-600" /><p className="text-sm text-zinc-400">This file is ready to download{file.path.startsWith("/@personal/") ? " or share" : ""}.</p><p className="text-xs text-zinc-500">Preview is available for supported pictures and videos, and small text files.</p></div> : file.binary ? (
                   <p className="p-6 text-sm text-zinc-500">Binary file — use Download.</p>
                 ) : file.editable ? (
                   <div className="overflow-hidden rounded-b-xl">
-                    <CodeMirror
+                    <FileEditor
+                      name={file.name}
                       value={draft}
-                      height="68vh"
-                      theme={oneDark}
-                      extensions={extensions}
                       onChange={(v) => {
                         setDraft(v);
                         setDirty(v !== file.content);
+                        dirtyRef.current = v !== file.content;
                         setStatus(null);
                       }}
+                      editable={!mutating && (!file.redacted || revealed)}
                     />
                   </div>
                 ) : (

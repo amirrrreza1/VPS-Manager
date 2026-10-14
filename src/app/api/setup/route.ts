@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { rateLimit } from "@/lib/rate-limit";
+import { sameOrigin, fail } from "@/lib/api-guard";
 
 export async function POST(req: Request) {
+  if (!sameOrigin(req)) return fail("cross-origin request rejected", 403);
   const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0]?.trim() || "unknown";
   if (!rateLimit(`setup:${ip}`, 5, 60_000)) {
     return NextResponse.json({ error: "too many attempts" }, { status: 429 });
@@ -20,6 +22,9 @@ export async function POST(req: Request) {
     password?: string;
   } | null;
 
+  if (!body || typeof body.username !== "string" || typeof body.password !== "string") return fail("invalid request");
+  // Recheck after reading the asynchronous body: only one account can exist.
+  if (countUsers() > 0) return fail("Setup already completed. Use the login page.", 409);
   const username = (body?.username ?? "").trim();
   const password = body?.password ?? "";
 

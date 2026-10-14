@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { validateSessionToken, sessionCookieName } from "@/lib/auth";
+import { validateSessionToken, sessionCookieName, countUsers, buildSessionCookie } from "@/lib/auth";
 
 /**
  * Two jobs:
@@ -13,6 +13,7 @@ const CSP = [
   "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
+  "media-src 'self'",
   "font-src 'self' data:",
   "connect-src 'self'",
   "frame-ancestors 'none'",
@@ -38,6 +39,7 @@ export function proxy(request: NextRequest) {
   // harden(): a bare NextResponse.redirect() would otherwise ship without
   // security headers.
   const harden = (response: NextResponse): NextResponse => {
+    if (session?.refreshed && token) response.headers.append("Set-Cookie", buildSessionCookie(token, session.expiresAt));
     response.headers.set("X-Frame-Options", "DENY");
     response.headers.set("X-Content-Type-Options", "nosniff");
     response.headers.set("Referrer-Policy", "no-referrer");
@@ -55,7 +57,7 @@ export function proxy(request: NextRequest) {
 
   if (!session && !isPublic) {
     const url = request.nextUrl.clone();
-    url.pathname = "/login";
+    url.pathname = countUsers() === 0 ? "/setup" : "/login";
     url.search = "";
     return harden(NextResponse.redirect(url));
   }
@@ -72,6 +74,8 @@ export function proxy(request: NextRequest) {
 
 export const config = {
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)",
+    // The streaming upload route checks auth/CSRF and sets its own headers.
+    // Running Proxy here would clone and buffer the entire upload in memory.
+    "/((?!api/files/upload(?:/|$)|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)",
   ],
 };

@@ -10,69 +10,79 @@ export default function SettingsPage() {
   const [recovery, setRecovery] = useState<string[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [securityCode, setSecurityCode] = useState("");
 
   useEffect(() => {
-    fetch("/api/auth/totp", { method: "POST", body: JSON.stringify({ action: "start" }) })
-      .then((r) => r.json())
+    fetch("/api/auth/totp")
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error ?? "Could not load settings");
+        return data;
+      })
       .then((d) => {
-        if (d.ok) {
-          // Setup data is fetched but not shown until requested; the QR is only
-          // rendered when the operator clicks enable.
-          sessionStorage.setItem("vpm_totp_qr", d.qr);
-          sessionStorage.setItem("vpm_totp_secret", d.secret);
-        } else {
-          setError(d.error);
-        }
-      });
+        setHasTotp(d.hasTotp);
+      })
+      .catch((e) => setError(e.message));
   }, []);
 
-  useEffect(() => {
-    fetch("/api/projects")
-      .then((r) => r.json())
-      .then(() => undefined)
-      .catch(() => undefined);
-  }, []);
+  async function request(path: string, body: Record<string, string>) {
+    setBusy(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const response = await fetch(path, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? "Request failed");
+      return data;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Request failed");
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function enable() {
-    setError(null);
-    try {
-      const res = await fetch("/api/auth/totp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "activate", code }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error);
-        return;
-      }
+      const data = await request("/api/auth/totp", { action: "activate", code });
+      if (!data) return;
       setRecovery(data.recoveryCodes);
       setHasTotp(true);
       setQr(null);
-      sessionStorage.removeItem("vpm_totp_qr");
-      sessionStorage.removeItem("vpm_totp_secret");
+      setSecret(null);
+      setCode("");
       setInfo("Two-factor authentication enabled.");
-    } catch {
-      setError("request failed");
-    }
   }
 
   async function disable() {
     if (!confirm("Disable two-factor authentication?")) return;
-    const res = await fetch("/api/auth/totp", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "disable" }),
-    });
-    if (res.ok) {
+    const data = await request("/api/auth/totp", { action: "disable", password: currentPassword, code: securityCode });
+    if (data) {
       setHasTotp(false);
       setInfo("Two-factor authentication disabled.");
+      setCurrentPassword("");
+      setSecurityCode("");
     }
   }
 
-  function showSetup() {
-    setQr(sessionStorage.getItem("vpm_totp_qr"));
-    setSecret(sessionStorage.getItem("vpm_totp_secret"));
+  async function showSetup() {
+    const data = await request("/api/auth/totp", { action: "start" });
+    if (data) { setQr(data.qr); setSecret(data.secret); setCode(""); }
+  }
+
+  async function changePassword(e: React.FormEvent) {
+    e.preventDefault();
+    if (newPassword !== confirmPassword) { setError("New passwords do not match."); return; }
+    const data = await request("/api/auth/password", { currentPassword, newPassword, code: securityCode });
+    if (data) {
+      setCurrentPassword(""); setNewPassword(""); setConfirmPassword(""); setSecurityCode("");
+      setInfo("Password changed. Other sessions have been signed out.");
+    }
   }
 
   return (
@@ -101,7 +111,7 @@ export default function SettingsPage() {
           containers.
         </p>
 
-        {recovery ? (
+        {hasTotp === null ? <p className="mt-4 text-sm text-zinc-500">Loading security settings…</p> : recovery ? (
           <div className="mt-4 space-y-3">
             <p className="text-sm text-amber-300">
               Save these recovery codes now. Each works once if you lose your authenticator.
@@ -112,19 +122,21 @@ export default function SettingsPage() {
               ))}
             </div>
             <button
-              onClick={() => {
-                void navigator.clipboard?.writeText(recovery.join("\n"));
-                setInfo("Recovery codes copied to clipboard.");
+              onClick={async () => {
+                try { await navigator.clipboard.writeText(recovery.join("\n")); setInfo("Recovery codes copied to clipboard."); }
+                catch { setError("Could not copy codes. Select and save them manually."); }
               }}
               className="rounded-lg border border-zinc-800 px-3 py-1.5 text-sm text-zinc-300 hover:border-zinc-700"
             >
               Copy codes
             </button>
+            <button onClick={() => setRecovery(null)} className="ml-2 text-sm text-zinc-400">I saved my codes</button>
           </div>
         ) : hasTotp === false ? (
           <div className="mt-4 flex gap-2">
             <button
               onClick={showSetup}
+              disabled={busy || !!qr}
               className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500"
             >
               Enable 2FA
@@ -134,12 +146,14 @@ export default function SettingsPage() {
           <div className="mt-4 flex gap-2">
             <button
               onClick={disable}
+              disabled={busy || !currentPassword || securityCode.length !== 6}
               className="rounded-lg border border-red-900 px-3 py-1.5 text-sm text-red-400 hover:bg-red-950/40"
             >
               Disable 2FA
             </button>
           </div>
         )}
+        {hasTotp && !recovery && <p className="mt-3 text-xs text-zinc-500">2FA is enabled. To disable it, enter your current password and authenticator code below.</p>}
       </section>
 
       {qr && secret && (
@@ -160,7 +174,8 @@ export default function SettingsPage() {
             />
             <button
               onClick={enable}
-              disabled={code.length !== 6}
+              aria-label="Authenticator code"
+              disabled={busy || code.length !== 6}
               className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40"
             >
               Confirm
@@ -168,6 +183,26 @@ export default function SettingsPage() {
           </div>
         </section>
       )}
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+        <h2 className="font-medium">Change password</h2>
+        <p className="mt-1 text-sm text-zinc-500">Use 12–200 characters. Changing security settings signs out other sessions.</p>
+        <form onSubmit={changePassword} className="mt-4 space-y-3">
+          <label className="block text-sm text-zinc-400">Current password
+            <input type="password" autoComplete="current-password" required maxLength={200} value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} className="mt-1 block w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2" />
+          </label>
+          {hasTotp && <label className="block text-sm text-zinc-400">Authenticator code
+            <input inputMode="numeric" autoComplete="one-time-code" value={securityCode} onChange={(e) => setSecurityCode(e.target.value.replace(/\D/g, "").slice(0, 6))} className="mt-1 block w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2" />
+          </label>}
+          <label className="block text-sm text-zinc-400">New password
+            <input type="password" autoComplete="new-password" required minLength={12} maxLength={200} value={newPassword} onChange={(e) => setNewPassword(e.target.value)} className="mt-1 block w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2" />
+          </label>
+          <label className="block text-sm text-zinc-400">Confirm new password
+            <input type="password" autoComplete="new-password" required minLength={12} maxLength={200} value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} className="mt-1 block w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2" />
+          </label>
+          <button disabled={busy || hasTotp === null} className="rounded-lg bg-emerald-600 px-3 py-2 text-sm text-white disabled:opacity-40">Change password</button>
+        </form>
+      </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
         <h2 className="font-medium">Deployment defaults</h2>

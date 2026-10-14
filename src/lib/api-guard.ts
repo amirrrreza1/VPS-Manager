@@ -23,14 +23,18 @@ export function clientMeta(req: Request): ClientMeta {
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
-function sameOrigin(req: Request): boolean {
+export function sameOrigin(req: Request): boolean {
   if (SAFE_METHODS.has(req.method)) return true;
   const origin = req.headers.get("origin");
   if (!origin) return true; // same-origin form posts / curl may omit it
   try {
     const url = new URL(req.url);
     const o = new URL(origin);
-    return o.host === url.host;
+    // Next's internal request URL can use localhost even when the browser
+    // reached 127.0.0.1 or a public domain. Host retains the browser-facing host.
+    const host = req.headers.get("host") ?? url.host;
+    return o.host === host && (o.protocol === url.protocol ||
+      (o.protocol === "https:" && req.headers.get("x-forwarded-proto") === "https"));
   } catch {
     return false;
   }

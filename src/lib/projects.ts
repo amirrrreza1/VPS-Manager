@@ -2,7 +2,7 @@ import "server-only";
 import fs from "node:fs";
 import path from "node:path";
 import { runSyncOrThrow, hasBinary, type RunResult } from "./exec";
-import { resolveDir, resolveSafe, toDisplayPath } from "./safe-path";
+import { resolveDir, resolveFile, resolveSafe, toDisplayPath } from "./safe-path";
 import { envRoots } from "./roots";
 
 /**
@@ -81,7 +81,8 @@ export function discoverProjects(): ProjectInfo[] {
         continue; // symlinked out of the root
       }
 
-      out.push(inspectProject(real, entry.name, git));
+      const project = inspectProject(real, entry.name, git);
+      if (project.isGitRepo || project.composeFile) out.push(project);
     }
   }
 
@@ -94,7 +95,9 @@ export function getProject(dirPath: string, git = gitAvailable()): ProjectInfo {
 }
 
 function inspectProject(abs: string, name: string, git: boolean): ProjectInfo {
-  const composeFile = COMPOSE_FILES.map((f) => path.join(abs, f)).find((f) => fs.existsSync(f)) ?? null;
+  const composeFile = COMPOSE_FILES.map((f) => path.join(/* turbopackIgnore: true */ abs, f)).find((f) => {
+    try { return fs.statSync(resolveFile(f)).isFile(); } catch { return false; }
+  }) ?? null;
 
   const isGitRepo = fs.existsSync(path.join(abs, ".git"));
   let branch: string | null = null;
@@ -143,8 +146,8 @@ function inspectProject(abs: string, name: string, git: boolean): ProjectInfo {
   }
 
   const envFile = [".env", ".env.production", ".env.local"]
-    .map((f) => path.join(abs, f))
-    .find((f) => fs.existsSync(f));
+    .map((f) => path.join(/* turbopackIgnore: true */ abs, f))
+    .find((f) => { try { return fs.statSync(resolveFile(f)).isFile(); } catch { return false; } });
   const envKeys = envFile ? parseEnvKeys(envFile) : [];
 
   let st: fs.Stats | null = null;
@@ -219,6 +222,8 @@ function parseCompose(file: string): { services: string[]; image: string | null 
 
       if (indent <= serviceIndent) {
         inService = false;
+        const nextService = line.match(/^([A-Za-z0-9._-]+):\s*$/);
+        if (nextService) { services.push(nextService[1]); inService = true; serviceIndent = indent; }
         if (line.startsWith("image:")) image = line.slice(6).trim();
         continue;
       }

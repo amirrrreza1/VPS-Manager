@@ -19,4 +19,9 @@ Cmnd_Alias VPM_COMPOSE = /usr/bin/docker compose -f *, \
                        /usr/bin/docker compose ls, \
                        /usr/bin/docker info
 
-vpm ALL=(root) NOPASSWD: VPM_COMPOSE
+# Fixed read-only inspections for the Server page.
+Cmnd_Alias VPM_INSPECT = /usr/bin/docker info --format *, \
+                       /usr/bin/docker ps --all --format *, \
+                       /usr/bin/docker stats --no-stream --format *
+
+vpm ALL=(root) NOPASSWD: VPM_COMPOSE, VPM_INSPECT

@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import { envRoots } from "./roots";
 
 /**
  * Central configuration.
@@ -18,19 +19,10 @@ const DEFAULT_ROOTS = isWindows
   ? [path.join(process.cwd(), ".dev-root")]
   : ["/opt"];
 
-function envRoots(): string[] {
-  const raw = process.env.VPM_ROOTS;
-  if (!raw) return DEFAULT_ROOTS;
-  return raw
-    .split(path.delimiter === ";" && isWindows ? ";" : ":")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
 export { envRoots };
 
 function devSeed() {
-  if (!isWindows) return;
+  if (!isWindows || process.env.VPM_ROOTS || process.env.NODE_ENV === "production") return;
   for (const r of DEFAULT_ROOTS) {
     try {
       fs.mkdirSync(path.join(r, "demo-api"), { recursive: true });
@@ -132,5 +124,7 @@ export const EDITABLE_EXTENSIONS = new Set([
 /** Largest file the editor will load into memory (bytes). */
 export const MAX_EDIT_BYTES = Number(process.env.VPM_MAX_EDIT_BYTES ?? 2 * 1024 * 1024);
 export const MAX_UPLOAD_BYTES = Number(
-  process.env.VPM_MAX_UPLOAD_BYTES ?? 25 * 1024 * 1024,
+  process.env.VPM_MAX_UPLOAD_BYTES ?? 1024 * 1024 * 1024,
 );
+// Compatibility multipart endpoint still buffers; large transfers use /upload.
+export const MAX_MULTIPART_UPLOAD_BYTES = Math.min(MAX_UPLOAD_BYTES, 25 * 1024 * 1024);

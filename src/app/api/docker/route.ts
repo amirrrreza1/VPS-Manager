@@ -2,10 +2,11 @@ import { NextResponse } from "next/server";
 import { requireAuth, fail } from "@/lib/api-guard";
 import { run } from "@/lib/exec";
 import { resolveDir, PathError } from "@/lib/safe-path";
+import { getProject } from "@/lib/projects";
 
 /** Read-only container inspection: list, logs, stats. No mutation. */
 
-const SAFE_LOG_ARGS = new Set(["compose", "logs", "ps", "top", "port", "config", "images", "version"]);
+const SAFE_LOG_ARGS = new Set(["logs", "ps"]);
 
 export async function GET(req: Request) {
   const auth = await requireAuth(req, "docker.inspect");
@@ -19,23 +20,25 @@ export async function GET(req: Request) {
 
   if (!project) return fail("project is required");
   if (!SAFE_LOG_ARGS.has(action)) return fail("unsupported action", 400);
+  if (service && (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(service))) return fail("invalid service", 400);
 
   try {
     const cwd = resolveDir(project);
-    const args = ["compose", "ps", "--format", "json"];
+    const info = getProject(cwd);
+    if (!info.composeFile) return fail("project has no compose file");
+    const args = ["compose", "-f", info.composeFile];
     if (action === "logs") {
-      args[0] = "compose";
-      args.splice(1, 1, "logs", "-t", "--tail", String(tail));
+      args.push("logs", "--no-color", "-t", "--tail", String(Number.isFinite(tail) ? tail : 200));
       if (service) args.push(service);
     } else if (action === "ps") {
-      // default
+      args.push("ps", "--all", "--format", "json");
     } else {
       return fail("unsupported action", 400);
     }
 
     const res = await run("docker", args, { cwd, timeoutMs: 30_000 });
     if (res.code !== 0) {
-      return NextResponse.json({ ok: false, error: res.stderr || res.stdout, raw: res.stdout });
+      return NextResponse.json({ ok: false, error: res.stderr || res.stdout, raw: res.stdout }, { status: 502 });
     }
     return NextResponse.json({ ok: true, output: res.stdout });
   } catch (err) {

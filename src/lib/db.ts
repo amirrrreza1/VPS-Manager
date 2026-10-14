@@ -8,9 +8,11 @@ import { DATA_DIR, DB_PATH } from "./config";
  */
 
 let _db: DatabaseSync | null = null;
+const runtime = globalThis as typeof globalThis & { __vpmDatabase?: { path: string; database: DatabaseSync } };
 
 export function db(): DatabaseSync {
   if (_db) return _db;
+  if (runtime.__vpmDatabase?.path === DB_PATH) return _db = runtime.__vpmDatabase.database;
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const database = new DatabaseSync(DB_PATH);
@@ -41,6 +43,12 @@ export function db(): DatabaseSync {
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 
+    CREATE TABLE IF NOT EXISTS login_challenges (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS audit (
       id       INTEGER PRIMARY KEY AUTOINCREMENT,
       ts       INTEGER NOT NULL,
@@ -70,9 +78,30 @@ export function db(): DatabaseSync {
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS file_shares (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      file_path TEXT NOT NULL,
+      file_version TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      revoked_at INTEGER,
+      max_downloads INTEGER,
+      downloads INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_file_shares_path ON file_shares(user_id, file_path);
   `);
 
+  const deployColumns = database.prepare("PRAGMA table_info(deploys)").all() as { name: string }[];
+  if (!deployColumns.some((column) => column.name === "error")) database.exec("ALTER TABLE deploys ADD COLUMN error TEXT");
+  if (!deployColumns.some((column) => column.name === "abs_path")) database.exec("ALTER TABLE deploys ADD COLUMN abs_path TEXT");
+  // This single-process service cannot resume work interrupted by a restart.
+  database.prepare("UPDATE deploys SET status = 'failed', finished_at = ?, error = 'service restarted during deploy' WHERE status IN ('queued', 'running')").run(Date.now());
+
   _db = database;
+  runtime.__vpmDatabase = { path: DB_PATH, database };
   return database;
 }
 
@@ -94,4 +123,5 @@ export function setSetting(key: string, value: string): void {
 export function closeDb(): void {
   _db?.close();
   _db = null;
+  delete runtime.__vpmDatabase;
 }

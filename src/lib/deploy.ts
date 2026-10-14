@@ -4,7 +4,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import crypto from "node:crypto";
 import { run, CommandError } from "./exec";
-import { resolveDir } from "./safe-path";
+import { resolveDir, resolveFile, resolveForWrite } from "./safe-path";
 import { db } from "./db";
 import { getProject } from "./projects";
 import { audit } from "./audit";
@@ -55,21 +55,34 @@ export interface DeployState {
   error: string | null;
 }
 
-export const deployEvents = new EventEmitter();
+const runtime = globalThis as typeof globalThis & { __vpmDeployRuntime?: {
+  events: EventEmitter; inflight: Map<string, DeployState>; handles: Map<string, DeployHandle>;
+} };
+const shared = runtime.__vpmDeployRuntime ??= {
+  events: new EventEmitter(), inflight: new Map(), handles: new Map(),
+};
+export const deployEvents = shared.events;
 deployEvents.setMaxListeners(50);
-
-const inflight = new Map<string, DeployState>();
-const handles = new Map<string, DeployHandle>();
+const inflight = shared.inflight;
+const handles = shared.handles;
 const MAX_LOG = 512 * 1024;
 
 export function getDeploy(id: string): DeployState | undefined {
-  return inflight.get(id);
+  const live = inflight.get(id);
+  if (live) return live;
+  const row = db().prepare("SELECT * FROM deploys WHERE id = ?").get(id) as DeployHistoryRow | undefined;
+  if (!row) return undefined;
+  let steps: DeployStep[] = [];
+  try { steps = row.log ? JSON.parse(row.log) : []; } catch { /* tolerate old truncated logs */ }
+  return { id: row.id, project: row.project, absPath: row.abs_path ?? "", branch: row.branch,
+    status: row.status as DeployStatus, steps, startedAt: row.started_at, finishedAt: row.finished_at,
+    commitBefore: row.commit_before, commitAfter: row.commit_after, error: row.error ?? null };
 }
 
 /** Request a cooperative abort of a running deploy. */
 export function abortDeploy(id: string): boolean {
   const handle = handles.get(id);
-  if (!handle) return false;
+  if (!handle || !["queued", "running"].includes(inflight.get(id)?.status ?? "")) return false;
   handle.abort();
   return true;
 }
@@ -101,6 +114,7 @@ function emit(state: DeployState): void {
 
 function appendOutput(state: DeployState, step: DeployStep, text: string): void {
   step.output = (step.output + text).slice(-MAX_LOG);
+  emit(state);
 }
 
 function finishStep(state: DeployState, step: DeployStep, code: number): void {
@@ -112,6 +126,7 @@ function finishStep(state: DeployState, step: DeployStep, code: number): void {
     step.output = step.output.trim().slice(-8000);
   }
   emit(state);
+  persist(state);
 }
 
 const stepStarted = new WeakMap<DeployStep, number>();
@@ -128,6 +143,14 @@ export function startDeploy(
   meta: { user: string; ip: string } = { user: "system", ip: "unknown" },
 ): DeployHandle {
   const absPath = resolveDir(projectPath);
+  if (listActiveDeploys().some((state) => state.absPath === absPath)) throw new Error("a deploy is already running for this project");
+  const info = getProject(absPath);
+  if (!info.composeFile) throw new Error("project has no compose file");
+  resolveFile(path.join(absPath, info.composeFile));
+  const branch = opts.branch ?? info.branch;
+  if (info.isGitRepo && (!branch || branch === "HEAD" || branch.startsWith("-") || !/^[A-Za-z0-9._/\-]+$/.test(branch))) {
+    throw new Error("select a valid origin branch before deploying");
+  }
   const id = crypto.randomUUID();
   let aborted = false;
 
@@ -150,16 +173,15 @@ export function startDeploy(
     state.status = "running";
     emit(state);
 
-    const info = getProject(absPath);
     state.branch = opts.branch ?? info.branch;
     state.commitBefore = info.commit;
 
     db()
       .prepare(
-        `INSERT INTO deploys (id, project, branch, status, started_at, commit_before)
-         VALUES (?, ?, ?, 'running', ?, ?)`,
+        `INSERT INTO deploys (id, project, branch, status, started_at, commit_before, abs_path)
+         VALUES (?, ?, ?, 'running', ?, ?, ?)`,
       )
-      .run(id, state.project, state.branch, state.startedAt, info.commit);
+      .run(id, state.project, state.branch, state.startedAt, info.commit, absPath);
 
     audit({
       user: meta.user,
@@ -171,6 +193,7 @@ export function startDeploy(
 
     const envBackups: { file: string; content: Buffer }[] = [];
     let success = false;
+    let stackTouched = false;
     // Declared outside the try so the rollback path can use it too.
     const compose = info.composeFile ?? "docker-compose.yml";
 
@@ -180,9 +203,9 @@ export function startDeploy(
         const s = addStep(state, "Back up environment files");
         stepStarted.set(s, Date.now());
         for (const name of [".env", ".env.production", ".env.local"]) {
-          const p = path.join(absPath, name);
-          if (fs.existsSync(p)) {
-            envBackups.push({ file: p, content: fs.readFileSync(p) });
+          const p = path.join(/* turbopackIgnore: true */ absPath, name);
+          if (fs.existsSync(/* turbopackIgnore: true */ p)) {
+            envBackups.push({ file: resolveFile(p), content: fs.readFileSync(resolveFile(p)) });
           }
         }
         appendOutput(
@@ -198,6 +221,8 @@ export function startDeploy(
       }
 
       // ---- 2. docker compose down ---------------------------------------
+      checkAborted(aborted);
+      stackTouched = true;
       const down = addStep(state, `docker compose down (${compose})`);
       stepStarted.set(down, Date.now());
       const downRes = await run(
@@ -211,6 +236,7 @@ export function startDeploy(
       // ---- 3. git fetch ---------------------------------------------------
       const gitAvailable = info.isGitRepo;
       if (gitAvailable) {
+        checkAborted(aborted);
         const fetch = addStep(state, "git fetch --all --prune");
         stepStarted.set(fetch, Date.now());
         const fetchRes = await run("git", ["fetch", "--all", "--prune"], {
@@ -222,6 +248,7 @@ export function startDeploy(
         if (fetchRes.code !== 0) throw new Error(`git fetch failed: ${fetchRes.stderr}`);
 
         // ---- 4. update working tree --------------------------------------
+        checkAborted(aborted);
         const branch = state.branch;
         const target = branch ? `origin/${branch}` : null;
         const update = addStep(
@@ -273,15 +300,17 @@ export function startDeploy(
       });
       finishStep(state, up, upRes.code);
       if (upRes.code !== 0) throw new Error(`docker compose up failed: ${upRes.stderr}`);
+      checkAborted(aborted);
 
       // ---- 6. health ------------------------------------------------------
       const timeoutSec = opts.healthTimeoutSec ?? 0;
       if (timeoutSec > 0) {
         const health = addStep(state, `Health check (timeout ${timeoutSec}s)`);
         stepStarted.set(health, Date.now());
-        const healthy = await waitForHealthy(absPath, compose, timeoutSec, (c) =>
+        const healthy = await waitForHealthy(absPath, compose, timeoutSec, () => aborted, (c) =>
           appendOutput(state, health, c),
         );
+        checkAborted(aborted);
         if (healthy) {
           appendOutput(state, health, "all services running");
           finishStep(state, health, 0);
@@ -296,8 +325,15 @@ export function startDeploy(
     } catch (err) {
       const message = err instanceof CommandError ? err.message : (err as Error).message;
       state.error = message;
+      for (const step of state.steps) if (step.status === "running") finishStep(state, step, 1);
 
       if (aborted) {
+        if (opts.autoRollback && stackTouched) {
+          const restore = addStep(state, "Restore previous version after abort");
+          const restored = await rollback(state, restore, absPath, compose, envBackups, opts);
+          finishStep(state, restore, restored ? 0 : 1);
+          if (!restored) state.error += "; restoring the previous stack failed";
+        }
         state.status = "aborted";
         state.finishedAt = Date.now();
         audit({ user: meta.user, action: "deploy.abort", target: state.project, ip: meta.ip, detail: { id } });
@@ -306,11 +342,12 @@ export function startDeploy(
         return state;
       }
 
-      if (opts.autoRollback && state.commitBefore) {
+      if (opts.autoRollback && stackTouched) {
         const rb = addStep(state, "Roll back to previous version");
         stepStarted.set(rb, Date.now());
         const ok = await rollback(state, rb, absPath, compose, envBackups, opts);
         if (ok) {
+          finishStep(state, rb, 0);
           state.status = "rolled_back";
           state.finishedAt = Date.now();
           audit({
@@ -354,7 +391,11 @@ export function startDeploy(
     emit(state);
     persist(state);
     return state;
-  })();
+  })().catch((error: unknown) => {
+    state.status = "failed"; state.finishedAt = Date.now();
+    state.error = error instanceof Error ? error.message : "deploy failed";
+    emit(state); persist(state); return state;
+  });
 
   const handle: DeployHandle = {
     id,
@@ -364,6 +405,12 @@ export function startDeploy(
     },
   };
   handles.set(id, handle);
+  void promise.finally(() => {
+    handles.delete(id);
+    // Retain a bounded set of completed deployments for stream reconnects.
+    const completed = [...inflight.values()].filter((d) => !["queued", "running"].includes(d.status));
+    for (const old of completed.slice(0, Math.max(0, completed.length - 50))) inflight.delete(old.id);
+  }).catch(() => undefined);
 
   return handle;
 }
@@ -372,7 +419,7 @@ function addStep(state: DeployState, label: string): DeployStep {
   const step: DeployStep = {
     n: state.steps.length + 1,
     label,
-    status: "pending",
+    status: "running",
     output: "",
     durationMs: 0,
   };
@@ -390,19 +437,21 @@ async function waitForHealthy(
   cwd: string,
   composeFile: string,
   timeoutSec: number,
+  isAborted: () => boolean,
   onOutput: (c: string) => void,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutSec * 1000;
   let last = "";
   while (Date.now() < deadline) {
+    if (isAborted()) return false;
     try {
-      const res = await run("docker", ["compose", "-f", composeFile, "ps", "--format", "json"], {
+      const res = await run("docker", ["compose", "-f", composeFile, "ps", "--all", "--format", "json"], {
         cwd,
         timeoutMs: 20_000,
       });
       if (res.code === 0) {
         last = res.stdout;
-        const lines = res.stdout.split("\n").filter(Boolean);
+        const lines: string[] = res.stdout.trim().startsWith("[") ? JSON.parse(res.stdout).map((s: unknown) => JSON.stringify(s)) : res.stdout.split("\n").filter(Boolean);
         const states = lines.map((l) => {
           try {
             return JSON.parse(l) as { State?: string; Health?: string };
@@ -412,7 +461,7 @@ async function waitForHealthy(
         });
         if (states.length > 0 && states.every(Boolean)) {
           const allUp = states.every(
-            (s) => s!.State === "running" && (s!.Health === undefined || s!.Health === "healthy"),
+            (s: { State?: string; Health?: string } | null) => s!.State === "running" && (!s!.Health || s!.Health === "healthy"),
           );
           if (allUp) return true;
         }
@@ -436,12 +485,6 @@ async function rollback(
 ): Promise<boolean> {
   const onOut = (c: string) => appendOutput(state, step, c);
   try {
-    // Restore env files first so the old build sees its original config.
-    for (const b of envBackups) {
-      fs.writeFileSync(b.file, b.content);
-      onOut(`restored ${path.basename(b.file)}\n`);
-    }
-
     if (state.commitBefore) {
       const r = await run("git", ["reset", "--hard", state.commitBefore], {
         cwd: absPath,
@@ -453,6 +496,12 @@ async function rollback(
         return false;
       }
       onOut(`reset to ${state.commitBefore.slice(0, 7)}\n`);
+    }
+
+    // Restore after git reset, which may overwrite tracked environment files.
+    for (const b of envBackups) {
+      fs.writeFileSync(resolveForWrite(b.file), b.content, { mode: 0o600 });
+      onOut(`restored ${path.basename(b.file)}\n`);
     }
 
     const upArgs = ["compose", "-f", composeFile, "up", "-d"];
@@ -472,17 +521,19 @@ async function rollback(
 
 function persist(state: DeployState): void {
   try {
-    const log = JSON.stringify(state.steps);
+    const perStep = Math.floor(MAX_LOG / Math.max(1, state.steps.length));
+    const log = JSON.stringify(state.steps.map((step) => ({ ...step, output: step.output.slice(-perStep) })));
     db()
       .prepare(
-        `UPDATE deploys SET status = ?, finished_at = ?, commit_after = ?, log = ?
+        `UPDATE deploys SET status = ?, finished_at = ?, commit_after = ?, log = ?, error = ?
          WHERE id = ?`,
       )
       .run(
         state.status,
         state.finishedAt,
         state.commitAfter,
-        log.length > MAX_LOG ? log.slice(-MAX_LOG) : log,
+        log,
+        state.error,
         state.id,
       );
   } catch {
@@ -500,6 +551,8 @@ export interface DeployHistoryRow {
   commit_before: string | null;
   commit_after: string | null;
   log: string | null;
+  error: string | null;
+  abs_path: string | null;
 }
 
 export function deployHistory(limit = 25): DeployHistoryRow[] {

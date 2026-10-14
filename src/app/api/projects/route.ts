@@ -31,7 +31,7 @@ export async function GET(req: Request) {
     const projects = discoverProjects();
     return NextResponse.json({
       projects,
-      active: listActiveDeploys().map((d) => ({ id: d.id, project: d.project, status: d.status })),
+      active: listActiveDeploys().map((d) => ({ id: d.id, project: d.project, path: d.absPath, status: d.status })),
       history: deployHistory(10),
       capabilities: {
         git: hasBinary("git"),

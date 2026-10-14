@@ -1,0 +1,38 @@
+services:
+  manager:
+    image: ${VPM_IMAGE:-vps-manager:production}
+    container_name: vps-manager
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${VPM_HOST_PORT:-3090}:3000"
+    group_add:
+      - "${VPM_DOCKER_GID:?Set VPM_DOCKER_GID to the Docker socket group}"
+    volumes:
+      - "${VPM_PROJECTS_ROOT:-/opt}:/opt"
+      - "${VPM_DATA_DIR:-/var/lib/vps-manager}:/data"
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Read-only telemetry. No privileged mode, host PID namespace or host
+      # service-control socket is needed by the Server page.
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/os-release:/host/os-release:ro
+      - /etc/hostname:/host/hostname:ro
+    environment:
+      VPM_ROOTS: /opt
+      VPM_DATA_DIR: /data
+      VPM_FILES_DIR: /data/files
+      VPM_MAX_UPLOAD_BYTES: ${VPM_MAX_UPLOAD_BYTES:-1073741824}
+      VPM_HOST_PROC: /host/proc
+      VPM_HOST_SYS: /host/sys
+      VPM_HOST_OS_RELEASE: /host/os-release
+      VPM_HOST_HOSTNAME: /host/hostname
+      HOME: /data/home
+      NODE_OPTIONS: --max-old-space-size=256
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

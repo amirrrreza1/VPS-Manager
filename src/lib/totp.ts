@@ -1,6 +1,7 @@
 import "server-only";
 import crypto from "node:crypto";
 import { authenticator } from "otplib";
+import { db, getSetting, setSetting } from "./db";
 
 /** TOTP + recovery codes. Kept separate from auth.ts so otplib is easy to swap. */
 
@@ -49,4 +50,25 @@ export function matchesRecoveryCode(storedDigest: string, submitted: string): bo
   const candidate = crypto.createHash("sha256").update(normalized).digest("hex");
   const set = new Set(storedDigest.split(","));
   return set.has(candidate);
+}
+
+/** Consume inside a transaction so a recovery code can only be used once. */
+export function consumeRecoveryCode(userId: number, submitted: string): boolean {
+  const database = db();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const key = `totp_recovery:${userId}`;
+    const stored = getSetting(key) ?? "";
+    if (!matchesRecoveryCode(stored, submitted)) {
+      database.exec("COMMIT");
+      return false;
+    }
+    const candidate = crypto.createHash("sha256").update(normalize(submitted)).digest("hex");
+    setSetting(key, stored.split(",").filter((digest) => digest !== candidate).join(","));
+    database.exec("COMMIT");
+    return true;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }

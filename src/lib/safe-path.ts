@@ -1,6 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
-import { envRoots } from "./roots";
+import { envRoots, fileRoots, personalFilesRoot, PERSONAL_PATH } from "./roots";
 import { IGNORED_DIRS } from "./config";
 
 /**
@@ -26,7 +26,7 @@ export class PathError extends Error {
 }
 
 function roots(): string[] {
-  return envRoots().map((r) => path.resolve(r));
+  return fileRoots().map((r) => path.resolve(r));
 }
 
 function rootRealpaths(): string[] {
@@ -39,13 +39,13 @@ function rootRealpaths(): string[] {
       // Skip rather than fail: it simply matches nothing.
     }
   }
-  return out;
+  return out.sort((a, b) => b.length - a.length);
 }
 
 function isInside(root: string, target: string): boolean {
   const rel = path.relative(root, target);
   if (rel === "") return true;
-  if (rel.startsWith("..")) return false;
+  if (rel === ".." || rel.startsWith(`..${path.sep}`)) return false;
   return !path.isAbsolute(rel);
 }
 
@@ -102,6 +102,12 @@ export function resolveSafe(
     throw new PathError("path too long");
   }
 
+  // Reserve a virtual namespace for personal storage. Constrain it to that
+  // root even when a wider project root exists; traversal cannot change scope.
+  if (input === PERSONAL_PATH || input.startsWith(`${PERSONAL_PATH}/`)) {
+    return resolveSafe(input.slice(PERSONAL_PATH.length).replace(/^\//, "") || ".", personalFilesRoot(), opts);
+  }
+
   const candidates = baseRoot
     ? [path.resolve(baseRoot)]
     : roots();
@@ -119,10 +125,13 @@ export function resolveSafe(
 
     // Treat the root as a virtual CWD: a relative path, or a path under the
     // root, both resolve inside it. Anything else is out of bounds.
-    const relativeish = input.startsWith(root) || input.startsWith("/") || path.isAbsolute(input);
-    const joined = relativeish
-      ? path.resolve(realRoot, input.replace(/^[/\\]+/, ""))
-      : path.resolve(realRoot, input);
+    // Preserve real absolute paths under a configured root (essential on
+    // Linux, where stripping '/' would duplicate /opt inside itself).
+    const absolute = path.resolve(input);
+    const knownAbsolute = path.isAbsolute(input) && [...roots(), ...rootRealpaths(), root, realRoot].some((r) => isInside(r, absolute));
+    const joined = knownAbsolute || (path.isAbsolute(input) && !input.startsWith("/"))
+      ? absolute
+      : path.resolve(realRoot, input.replace(/^[/\\]+/, ""));
 
     let resolved: string;
     try {
@@ -138,7 +147,7 @@ export function resolveSafe(
       continue;
     }
 
-    const leafExists = fs.existsSync(resolved);
+    const leafExists = fs.existsSync(/* turbopackIgnore: true */ resolved);
     if (opts.mustExist && !leafExists) {
       lastError = new PathError("not found", 404);
       continue;
@@ -163,7 +172,7 @@ export function resolveFile(input: string, baseRoot?: string): string {
 /** Resolve a path and require it to be an existing directory. */
 export function resolveDir(input: string, baseRoot?: string): string {
   const p = resolveFile(input, baseRoot);
-  if (!fs.statSync(p).isDirectory()) {
+  if (!fs.statSync(/* turbopackIgnore: true */ p).isDirectory()) {
     throw new PathError("not a directory", 400);
   }
   return p;
@@ -194,13 +203,15 @@ export function listDir(dir: string, opts: { showHidden?: boolean } = {}): DirEn
   const realDir = resolveDir(dir);
   const realRoot = enclosingRoot(realDir);
   const showHidden = opts.showHidden ?? true;
+  const personalStorage = toDisplayPath(realDir) === PERSONAL_PATH || toDisplayPath(realDir).startsWith(`${PERSONAL_PATH}/`);
 
-  const names = fs.readdirSync(realDir);
+  const names = fs.readdirSync(/* turbopackIgnore: true */ realDir);
   const entries: DirEntry[] = [];
 
   for (const name of names) {
     if (!showHidden && name.startsWith(".")) continue;
-    if (IGNORED_DIRS.has(name) && name !== ".env") continue;
+    if (name.startsWith(".vpm-upload-")) continue;
+    if (!personalStorage && IGNORED_DIRS.has(name) && name !== ".env") continue;
 
     // turbopackIgnore: the browsed tree is runtime data under VPM_ROOTS, not
     // application source. Tracing it would drag the whole server into the build.
@@ -255,7 +266,18 @@ export function enclosingRoot(p: string): string | null {
 
 /** Absolute path -> path relative to its root, for display. */
 export function toDisplayPath(p: string): string {
-  for (const r of rootRealpaths()) {
+  try {
+    const personal = fs.realpathSync.native(personalFilesRoot());
+    if (isInside(personal, p)) {
+      const relative = path.relative(personal, p).split(path.sep).join("/");
+      return relative ? `${PERSONAL_PATH}/${relative}` : PERSONAL_PATH;
+    }
+  } catch { /* storage has not been created yet */ }
+  // Absolute paths avoid collisions between equally named projects in roots.
+  if (envRoots().length > 1) return p.split(path.sep).join("/");
+  for (const root of envRoots()) {
+    let r: string;
+    try { r = fs.realpathSync.native(root); } catch { continue; }
     if (isInside(r, p)) {
       const rel = path.relative(r, p);
       return rel === "" ? "/" : `/${rel.split(path.sep).join("/")}`;

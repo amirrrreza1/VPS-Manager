@@ -24,8 +24,8 @@ WORKDIR /app
 # git and docker-cli are REQUIRED at runtime:
 #   - git drives the deploy pipeline (fetch / reset)
 #   - docker-cli provides the `docker compose` plugin the pipeline calls
-# The app itself never runs as root; it reaches docker through sudo (see
-# deploy/vps-manager.sudoers).
+# The app runs as a non-root user and accesses the mounted Docker socket
+# through a supplementary group supplied with --group-add.
 RUN apk add --no-cache \
       git \
       docker-cli \
@@ -43,6 +43,7 @@ ENV NODE_ENV=production \
 COPY --from=deps  --chown=vpm:vpm /app/node_modules ./node_modules
 COPY --from=builder --chown=vpm:vpm /app/.next ./.next
 COPY --from=builder --chown=vpm:vpm /app/package.json ./package.json
+COPY --from=builder --chown=vpm:vpm /app/next.config.mjs ./next.config.mjs
 COPY --from=builder --chown=vpm:vpm /app/public ./public
 
 # The app needs to READ and WRITE files under /opt, and to READ its own state.

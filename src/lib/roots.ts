@@ -20,3 +20,16 @@ export function envRoots(): string[] {
     .map((s) => s.trim())
     .filter(Boolean);
 }
+
+// Kept outside project roots and the public webroot. The existing /data volume
+// persists personal files without exposing the account database or Git home.
+export const PERSONAL_PATH = "/@personal";
+export function personalFilesRoot(): string {
+  return path.resolve(/* turbopackIgnore: true */ process.env.VPM_FILES_DIR ?? path.join(
+    process.env.VPM_DATA_DIR ?? path.join(process.cwd(), ".vpm-data"), "files",
+  ));
+}
+
+export function fileRoots(): string[] {
+  return [...envRoots(), personalFilesRoot()];
+}

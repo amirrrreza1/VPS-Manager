@@ -19,7 +19,7 @@ export default function ActivityPage() {
 
   useEffect(() => {
     fetch("/api/audit?limit=150")
-      .then((r) => r.json())
+      .then(async (r) => { const data = await r.json(); if (!r.ok) throw new Error(data.error ?? "Could not load activity"); return data; })
       .then((d) => setEntries(d.entries ?? []))
       .catch((e) => setError((e as Error).message));
   }, []);
@@ -38,7 +38,7 @@ export default function ActivityPage() {
       {!entries ? (
         <p className="text-sm text-zinc-500">Loading…</p>
       ) : (
-        <div className="overflow-hidden rounded-xl border border-zinc-800">
+        <div className="overflow-x-auto rounded-xl border border-zinc-800">
           <table className="w-full text-left text-sm">
             <thead className="bg-zinc-900/60 text-xs text-zinc-500">
               <tr>

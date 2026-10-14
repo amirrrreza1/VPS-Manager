@@ -109,6 +109,8 @@ export interface SessionUser {
   id: number;
   username: string;
   hasTotp: boolean;
+  expiresAt: number;
+  refreshed: boolean;
 }
 
 export function validateSessionToken(token: string | undefined): SessionUser | null {
@@ -117,28 +119,30 @@ export function validateSessionToken(token: string | undefined): SessionUser | n
 
   const row = db()
     .prepare(
-      `SELECT s.id AS sid, s.expires_at, u.id, u.username, u.totp_secret
+      `SELECT s.id AS sid, s.expires_at, s.last_seen_at, u.id, u.username, u.totp_secret
        FROM sessions s JOIN users u ON u.id = s.user_id
        WHERE s.id = ?`,
     )
     .get(sessionHash(token)) as
-    | { sid: string; expires_at: number; id: number; username: string; totp_secret: string | null }
+    | { sid: string; expires_at: number; last_seen_at: number; id: number; username: string; totp_secret: string | null }
     | undefined;
 
   if (!row) return null;
-  if (row.expires_at < now) {
+  if (row.expires_at <= now) {
     db().prepare("DELETE FROM sessions WHERE id = ?").run(row.sid);
     return null;
   }
 
   // Sliding window: extend at most once a minute to avoid a write per request.
-  if (now - (row.expires_at - SESSION_TTL_MS) > SESSION_TTL_MS - 60_000) {
+  const refreshed = now - row.last_seen_at >= 60_000;
+  if (refreshed) {
     db()
       .prepare("UPDATE sessions SET expires_at = ?, last_seen_at = ? WHERE id = ?")
       .run(now + SESSION_TTL_MS, now, row.sid);
+    row.expires_at = now + SESSION_TTL_MS;
   }
 
-  return { id: row.id, username: row.username, hasTotp: !!row.totp_secret };
+  return { id: row.id, username: row.username, hasTotp: !!row.totp_secret, expiresAt: row.expires_at, refreshed };
 }
 
 export function destroySession(token: string | undefined): void {
@@ -148,6 +152,26 @@ export function destroySession(token: string | undefined): void {
 
 export function destroyAllSessions(userId: number): void {
   db().prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
+  db().prepare("DELETE FROM login_challenges WHERE user_id = ?").run(userId);
+}
+
+export function createLoginChallenge(userId: number): string {
+  const token = crypto.randomBytes(32).toString("base64url");
+  db().prepare("DELETE FROM login_challenges WHERE expires_at <= ?").run(Date.now());
+  db().prepare("INSERT INTO login_challenges (id, user_id, expires_at) VALUES (?, ?, ?)")
+    .run(sessionHash(token), userId, Date.now() + 5 * 60_000);
+  return token;
+}
+
+export function getLoginChallenge(token: string | undefined): UserRow | null {
+  if (!token) return null;
+  const row = db().prepare("SELECT user_id FROM login_challenges WHERE id = ? AND expires_at > ?")
+    .get(sessionHash(token), Date.now()) as { user_id: number } | undefined;
+  return row ? getUserById(row.user_id) : null;
+}
+
+export function consumeLoginChallenge(token: string): void {
+  db().prepare("DELETE FROM login_challenges WHERE id = ?").run(sessionHash(token));
 }
 
 export function purgeExpiredSessions(): void {
@@ -164,13 +188,12 @@ export async function getSessionUser(): Promise<SessionUser | null> {
 }
 
 export function buildSessionCookie(token: string, expiresAt: number): string {
-  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
   return [
     `${SESSION_COOKIE}=${token}`,
     "Path=/",
     "HttpOnly",
     "SameSite=Strict",
-    secure,
+    ...(process.env.NODE_ENV === "production" ? ["Secure"] : []),
     `Expires=${new Date(expiresAt).toUTCString()}`,
   ].join("; ");
 }
