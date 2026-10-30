@@ -2,6 +2,7 @@ import path from "node:path";
 import { run as realRun, CommandError } from "../src/lib/exec.ts";
 export { CommandError };
 export const calls = [];
+export const healthScenarios = new Map();
 const builds = new Map();
 export async function run(bin, args, options) {
   calls.push({ bin, args, cwd: options.cwd });
@@ -10,8 +11,12 @@ export async function run(bin, args, options) {
   await new Promise((resolve) => setTimeout(resolve, 20));
   let code = 0;
   let stdout = "";
-  if (args.includes("ps")) {
-    const states = [{ State: "running", Health: "" }];
+  const health = healthScenarios.get(options.cwd);
+  if (args.includes("config")) {
+    code = health?.configCode ?? 0;
+    stdout = JSON.stringify(health?.config ?? { services: { app: {} } });
+  } else if (args.includes("ps")) {
+    const states = health?.states ?? [{ Service: "app", State: "running", Health: "" }];
     stdout = scenario.includes("array") ? JSON.stringify(states) : states.map(JSON.stringify).join("\n");
   } else if (args.includes("up")) {
     const count = (builds.get(options.cwd) ?? 0) + 1; builds.set(options.cwd, count);

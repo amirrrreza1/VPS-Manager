@@ -10,7 +10,7 @@ process.env.VPM_ROOTS = root; process.env.VPM_DATA_DIR = path.join(temporary, "d
 const { startDeploy, abortDeploy, deployEvents, getDeploy, deployHistory } = await import("../src/lib/deploy.ts");
 const { closeDb } = await import("../src/lib/db.ts");
 // @ts-expect-error The fake executable is a JavaScript-only test fixture.
-const { calls } = await import("./fake-exec.mjs");
+const { calls, healthScenarios } = await import("./fake-exec.mjs");
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 let passed = 0;
 function fixture(name: string) {
@@ -28,6 +28,48 @@ try {
     assert.equal(state.status, "succeeded"); assert.ok(state.steps.every((step) => step.status === "ok"));
     assert.equal(abortDeploy(handle.id), false);
     passed++; console.log(`PASS ${name}: health output without Docker healthchecks and canonical deploy lock`);
+  }
+  const migrationConfig = {
+    services: {
+      db: {}, migrate: {},
+      web: { depends_on: { migrate: { condition: "service_completed_successfully" } } },
+      worker: { depends_on: { migrate: { condition: "service_completed_successfully" } } },
+    },
+  };
+  const healthyStack = [
+    { Service: "db", State: "running", Health: "healthy", ExitCode: 0 },
+    { Service: "migrate", State: "exited", Health: "", ExitCode: 0 },
+    { Service: "web", State: "running", Health: "healthy", ExitCode: 0 },
+    { Service: "worker", State: "running", Health: "healthy", ExitCode: 0 },
+  ];
+  for (const name of ["migration-array", "migration-ndjson"]) {
+    const dir = fixture(name);
+    healthScenarios.set(dir, { config: migrationConfig, states: healthyStack });
+    const state = await startDeploy(dir, { healthTimeoutSec: 1 }).promise;
+    assert.equal(state.status, "succeeded", JSON.stringify(state));
+    assert.ok(state.steps.every((step) => step.status === "ok"));
+    passed++; console.log(`PASS ${name}: completed migration and healthy services pass deployment health`);
+  }
+  for (const [name, service, changes, config, configCode] of [
+    ["migration-failed", "migrate", { ExitCode: 1 }, migrationConfig, 0],
+    ["migration-unfinished", "migrate", { State: "running" }, migrationConfig, 0],
+    ["migration-exit-unknown", "migrate", { ExitCode: undefined }, migrationConfig, 0],
+    ["application-stopped", "web", { State: "exited", Health: "" }, migrationConfig, 0],
+    ["application-unhealthy", "web", { Health: "unhealthy" }, migrationConfig, 0],
+    ["application-starting", "web", { Health: "starting" }, migrationConfig, 0],
+    ["migration-not-a-completion-dependency", "migrate", {}, {
+      services: { web: { depends_on: { migrate: { condition: "service_started" } } }, migrate: {} },
+    }, 0],
+    ["migration-config-unavailable", "migrate", {}, migrationConfig, 1],
+  ] as const) {
+    const dir = fixture(name);
+    const states = healthyStack.map((row) => row.Service === service ? { ...row, ...changes } : row);
+    healthScenarios.set(dir, { config, states, configCode });
+    const state = await startDeploy(dir, { healthTimeoutSec: 1 }).promise;
+    assert.equal(state.status, "failed", `${name}: ${JSON.stringify(state)}`);
+    assert.match(state.error!, /health check timed out/);
+    assert.equal(state.steps.find((step) => step.label.startsWith("Health check"))?.status, "failed");
+    passed++; console.log(`PASS ${name}: deployment health still fails`);
   }
   const rollbackDir = fixture("rollback");
   git(rollbackDir, "init", "-b", "main");

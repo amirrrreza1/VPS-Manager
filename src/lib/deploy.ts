@@ -312,12 +312,12 @@ export function startDeploy(
         );
         checkAborted(aborted);
         if (healthy) {
-          appendOutput(state, health, "all services running");
+          appendOutput(state, health, "all services running or completed successfully");
           finishStep(state, health, 0);
           success = true;
         } else {
           finishStep(state, health, 1);
-          throw new Error("health check timed out - containers not running");
+          throw new Error("health check timed out - services not healthy or jobs not completed");
         }
       } else {
         success = true;
@@ -433,6 +433,13 @@ function checkAborted(aborted: boolean): void {
   if (aborted) throw new Error("aborted by operator");
 }
 
+interface ComposeHealthState {
+  Service?: string;
+  State?: string;
+  Health?: string;
+  ExitCode?: number;
+}
+
 async function waitForHealthy(
   cwd: string,
   composeFile: string,
@@ -441,6 +448,29 @@ async function waitForHealthy(
   onOutput: (c: string) => void,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutSec * 1000;
+  const completionJobs = new Set<string>();
+  if (isAborted()) return false;
+  try {
+    // Compose normalizes dependencies for us. Never log this output, since
+    // the resolved configuration can contain environment secrets.
+    const config = await run("docker", ["compose", "-f", composeFile, "config", "--format", "json"], {
+      cwd,
+      timeoutMs: Math.min(20_000, timeoutSec * 1000),
+    });
+    if (config.code !== 0) throw new Error("compose config failed");
+    const parsed = JSON.parse(config.stdout) as {
+      services?: Record<string, { depends_on?: Record<string, { condition?: string }> }>;
+    };
+    for (const service of Object.values(parsed.services ?? {})) {
+      for (const [name, dependency] of Object.entries(service.depends_on ?? {})) {
+        if (dependency.condition === "service_completed_successfully") completionJobs.add(name);
+      }
+    }
+  } catch {
+    // Without explicit completion conditions, keep requiring running services.
+    completionJobs.clear();
+    onOutput("Could not read Compose dependency conditions; all containers must remain running.\n");
+  }
   let last = "";
   while (Date.now() < deadline) {
     if (isAborted()) return false;
@@ -454,17 +484,19 @@ async function waitForHealthy(
         const lines: string[] = res.stdout.trim().startsWith("[") ? JSON.parse(res.stdout).map((s: unknown) => JSON.stringify(s)) : res.stdout.split("\n").filter(Boolean);
         const states = lines.map((l) => {
           try {
-            return JSON.parse(l) as { State?: string; Health?: string };
+            return JSON.parse(l) as ComposeHealthState;
           } catch {
             return null;
           }
         });
-        if (states.length > 0 && states.every(Boolean)) {
-          const allUp = states.every(
-            (s: { State?: string; Health?: string } | null) => s!.State === "running" && (!s!.Health || s!.Health === "healthy"),
-          );
-          if (allUp) return true;
-        }
+        const allReady = states.length > 0 && states.every((s) => {
+          if (!s) return false;
+          if (s.Service && completionJobs.has(s.Service)) {
+            return s.State === "exited" && s.ExitCode === 0;
+          }
+          return s.State === "running" && (!s.Health || s.Health === "healthy");
+        });
+        if (allReady) return true;
       }
     } catch {
       /* keep polling */
