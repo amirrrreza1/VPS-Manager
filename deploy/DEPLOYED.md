@@ -1,4 +1,41 @@
-# VPS deployment — 9 October 2026
+# VPS deployment — 20 November 2026
+
+Live at <https://atlas.amirrrreza.ir/login> with image
+`vps-manager:automation-20261120-v1`, running Next.js 16.4.6 as UID 1001.
+The initial automation rollout used this image tag and the source under
+`/srv/vps-manager/releases/automation-20261120-v1`. Commit-based updates record
+their exact Git revision and image in `/srv/vps-manager/release.json`.
+
+New functionality includes Git repository import, static/image/PostgreSQL/Redis
+templates, background Git deployment, stack controls, daily panel-database
+snapshots and Docker build-cache maintenance. Generated services bind to loopback;
+PostgreSQL and Redis passwords are generated into private project `.env` files.
+Existing projects retain their configurations and have no automatic-deployment
+rules enabled. Enable updates individually on the Projects page.
+
+The live release passed 29 real-Docker checks and 142 HTTP checks in a disposable
+non-root container on the VPS, plus the unit suites. Verification included
+background deployment with no browser open, build/health rollback, abort recovery,
+stack controls, a serving static website, ready PostgreSQL, authenticated Redis,
+and session/history persistence. The local production build, lint, typecheck,
+dependency audit and desktop/mobile browser checks passed. Both production and
+full dependency audits reported zero vulnerabilities at release time.
+
+Before activation, the live database and deployment configuration were backed up
+to `/srv/vps-manager/backups/automation-20261120T014359Z`. The previous
+`vps-manager:c27cdbf` image and source release remain available. Activation verified
+unchanged persistent mounts and account count, authenticated pages and Docker
+access, a successful database snapshot, public HTTPS and unchanged start times
+for every unrelated application container. The temporary verification session
+was removed. `source` points to the new release and `compose.env` selects its image.
+
+Automatic database snapshots are stored at `/var/lib/vps-manager/backups` on the
+host, retain seven copies and are separate from the release backup above. They
+cover panel state, not project volumes or personal files. Generated services need
+reverse-proxy configuration or an SSH tunnel for external access. Host OS package
+and firewall administration remain outside the panel's controls.
+
+## Previous deployment — 9 October 2026
 
 VPS Manager runs on `5.102.37.139` as the non-root `vpm` container user.
 The deployed image is `vps-manager:20261009-files-tree-v3` (Next.js 16.3.8).

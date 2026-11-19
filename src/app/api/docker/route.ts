@@ -3,6 +3,7 @@ import { requireAuth, fail } from "@/lib/api-guard";
 import { run } from "@/lib/exec";
 import { resolveDir, PathError } from "@/lib/safe-path";
 import { getProject } from "@/lib/projects";
+import { controlStack, type StackAction } from "@/lib/stack-control";
 
 /** Read-only container inspection: list, logs, stats. No mutation. */
 
@@ -45,4 +46,15 @@ export async function GET(req: Request) {
     if (err instanceof PathError) return fail(err.message, err.status);
     return fail((err as Error).message, 500);
   }
+}
+
+export async function POST(req: Request) {
+  const auth = await requireAuth(req, "docker.control");
+  if ("response" in auth) return auth.response;
+  const body = await req.json().catch(() => null);
+  if (!body || typeof body.project !== "string" || !["start", "stop", "restart"].includes(body.action)) return fail("project and a supported action are required");
+  try {
+    const output = await controlStack(body.project, body.action as StackAction, { user: auth.user.username, ip: auth.meta.ip });
+    return NextResponse.json({ ok: true, output });
+  } catch (error) { return fail((error as Error).message, (error as Error).message.startsWith("project busy") ? 409 : 400); }
 }

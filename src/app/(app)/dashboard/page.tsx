@@ -2,9 +2,12 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { NewProject, ProjectControls } from "./project-tools";
+import type { Automation } from "@/lib/automation";
 import { ServerOverview } from "../server/server-overview";
 
 interface Project {
+  absPath: string;
   name: string;
   path: string;
   isGitRepo: boolean;
@@ -39,6 +42,8 @@ interface DeployRecord {
 }
 
 export default function DashboardPage() {
+  const [roots, setRoots] = useState<string[]>([]);
+  const [automation, setAutomation] = useState<Automation[]>([]);
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [caps, setCaps] = useState<Capabilities | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -55,6 +60,9 @@ export default function DashboardPage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setProjects(data.projects);
+      setRoots(data.roots ?? []);
+      const automatic = await fetch("/api/automation");
+      if (automatic.ok) setAutomation((await automatic.json()).rules);
       setCaps(data.capabilities);
       setHistory(data.history ?? []);
       if (data.active?.length) {
@@ -72,6 +80,8 @@ export default function DashboardPage() {
     // async boundary.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
+    const timer = window.setInterval(() => { if (!document.hidden) void load(); }, 15_000);
+    return () => window.clearInterval(timer);
   }, [load]);
 
   // Live-tail the running deploy over SSE.
@@ -116,7 +126,7 @@ export default function DashboardPage() {
     return () => { disposed = true; es.close(); if (poll) clearInterval(poll); };
   }, [deployId, load]);
 
-  async function deploy(p: Project) {
+  async function deploy(p: Pick<Project, "dirty" | "name" | "path">) {
     if (p.dirty && !confirm(`Deploy ${p.name}? This discards uncommitted changes in the project.`)) return;
     setBusy(p.name);
     setLogs([]);
@@ -190,6 +200,7 @@ export default function DashboardPage() {
 
       {error && <p role="alert" className="rounded-lg border border-red-900 bg-red-950/40 p-3 text-sm text-red-300">{error}</p>}
       {result && <p role="status" className="text-sm text-zinc-300">Deploy: {result.replaceAll("_", " ")}</p>}
+      <NewProject roots={roots} canDeploy={!!caps?.dockerCompose} onCreated={async (project, immediate) => { await load(); if (immediate) await deploy(project); }} />
       <ServerOverview />
 
       {caps && !caps.dockerCompose && (
@@ -202,7 +213,7 @@ export default function DashboardPage() {
 
       {projects && projects.length === 0 && (
         <p className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-6 text-center text-sm text-zinc-500">
-          No projects found. Check the <code className="text-zinc-400">VPM_ROOTS</code> environment
+          No projects found. Create your first project above, or check the <code className="text-zinc-400">VPM_ROOTS</code> environment
           variable, or create a directory with a <code className="text-zinc-400">docker-compose.yml</code>.
         </p>
       )}
@@ -270,6 +281,7 @@ export default function DashboardPage() {
                 </button>
               </div>
             </div>
+            <ProjectControls project={p} disabled={busy !== null || !caps?.dockerCompose} automation={automation.find((rule) => rule.path === p.absPath)} onChange={load} />
           </div>
         ))}
       </div>

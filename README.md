@@ -8,11 +8,26 @@ edit project files, and deploy Dockerized projects with one button.
 - **Projects** — auto-discovers directories under `VPM_ROOTS` (default `/opt`)
   that contain a git repo and/or a compose file. Shows branch, commit, whether
   it is behind `origin`, services, and `.env` key names (never values).
-- **Deploy** — one click runs: back up `.env` → `docker compose down` →
-  `git fetch --all --prune` → `git reset --hard origin/<branch>` →
-  `docker compose up -d --build` → optional health check → automatic rollback
+- **Create projects and services** — import a Git repository, scaffold a static
+  website, deploy a Docker image, or add persistent PostgreSQL and Redis services.
+  Generated services bind to loopback and restart after crashes or VPS reboots.
+- **Automatic deployment** — opt each Git project into background origin checks
+  at the selected interval (the UI offers 1–60 minutes). Clean, fast-forward updates deploy with health checks and
+  rollback. Dirty or divergent repositories are skipped; failed commits are not
+  repeatedly retried. The worker runs even with the browser closed.
+- **Stack controls** — start, stop, and restart projects. Stopping also pauses
+  automatic deployment and preserves data volumes.
+- **Deploy** — one click runs: back up `.env` → validate Compose →
+  `git fetch --all --prune` → `git reset --hard origin/<branch>` → restore `.env` →
+  validate the candidate → `docker compose build` → `docker compose up -d --no-build`
+  → optional health check → automatic rollback
   on failure. The dashboard enables a 60-second health check; live output uses
   SSE with a polling fallback. Recent deployments survive service restarts.
+  Current containers stay running during fetch and build. Replacement can still
+  cause brief downtime; bind-mounted source files change when Git updates them.
+- **Maintenance** — daily online panel-database snapshots with seven retained
+  copies, on-demand snapshots, Docker disk usage, and unused build-cache cleanup
+  for entries older than seven days. No container or volume pruning is performed.
 - **Personal files** — a private storage area on your VPS, multiple uploads
   with drag-and-drop, progress and cancellation, and direct downloads of any
   size. Uploads stream to disk and never overwrite existing files.
@@ -68,10 +83,56 @@ variables or copy it to `.env.local` and adjust the directories.
 | `VPM_SESSION_TTL_MS` | `43200000` (12h) | Session lifetime (sliding). |
 | `VPM_MAX_EDIT_BYTES` | `2097152` (2 MB) | Largest file the editor will open. |
 | `VPM_MAX_UPLOAD_BYTES` | `1073741824` (1 GiB) | Largest streamed upload per file. Downloads have no application size cap. Keep the reverse proxy's body limit aligned. The compatibility multipart endpoint remains limited to 25 MiB. |
+| `VPM_AUTOMATION` | `1` | Set to `0` to suspend background Git deployment globally. Per-project rules remain stored. |
+| `VPM_AUTO_BACKUP` | `1` | Daily online SQLite snapshots under `VPM_DATA_DIR/backups`; set to `0` to disable. |
 | `VPM_HOST_PROC` | `/host/proc` when present | Optional read-only host procfs mount for CPU, memory, uptime, process and network telemetry in a container. Native Linux falls back to `/proc`. |
 | `VPM_HOST_SYS` | `/host/sys` when host procfs is available | Read-only sysfs mount for interface state and link speed. |
 | `VPM_HOST_OS_RELEASE` | `/host/os-release` | Read-only host `/etc/os-release` file for the VPS distribution name. |
 | `VPM_HOST_HOSTNAME` | `/host/hostname` | Read-only host `/etc/hostname` file. |
+
+## Project automation
+
+Use **New project or service** on Projects. Pick the root and template, then
+create the project. Git import uses existing Compose when present; otherwise it
+generates Compose around an existing Dockerfile, or an npm application with a
+lockfile and a `start` script. Generated npm builds run the package's `build`
+script when present. Other runtimes need their own Dockerfile or Compose file.
+Review generated files and configure `.env` through Files before the first deploy.
+Generated image and repository Compose files load this `.env` at runtime.
+
+For private repositories, configure server Git credentials in the panel's private
+home. SSH cloning requires keys and a trusted `known_hosts` there; the production
+image includes the SSH client. Repository URLs cannot embed access tokens or
+passwords. Clone errors are deliberately generic so credentials do not appear
+in a response. Existing repository Compose ports, mounts, and restart settings
+are preserved; inspect them before deployment.
+
+On a Git project's card, select a check interval and click **Enable auto deploy**.
+Every 15 seconds the worker finds due projects, fetches origin and checks for
+fast-forward updates. It deploys one automatic update at a time using health
+checks, environment preservation and rollback. Manual deployment and stack
+control share a lock with these checks. A dirty tree, local commits, a missing
+upstream or a failed fetch leaves the project untouched and displays the reason.
+Each candidate commit is attempted once; after failure, inspect history and deploy
+manually, or push another commit. Pausing and reenabling does not reset that guard.
+Do not rename an enabled project's directory; pause it first and enable the new
+location after renaming. Rules and attempted commits persist across panel restarts.
+
+**Stop** also pauses automatic updates and keeps volumes. **Start** brings up
+existing images without building and leaves automation paused; **Deploy** builds
+updated files. Template restart policies let Docker recover exited services and
+restart them after reboot. They do not repair an unhealthy but still running
+application. Adding PostgreSQL or Redis provisions a separate Compose project;
+configure application connections through your own Compose networks or host
+access. A service's loopback port is not its address from another container.
+
+The Server page shows Docker disk usage, offers old unused build-cache cleanup
+and can take a database snapshot immediately. Daily snapshots run independently
+of project automation and keep seven copies under `VPM_DATA_DIR/backups` with
+private permissions. These are local panel-database snapshots, not project,
+database-volume or personal-file backups. Copy backups off the VPS for disaster
+recovery. The service must run continuously for scheduled work; missed checks
+are picked up after restart. Run a single panel process, not multiple replicas.
 
 ## Server monitoring
 
@@ -81,8 +142,10 @@ page is visible, share a five-second server-side cache, and deduplicate simultan
 requests. CPU, memory and traffic charts retain up to 60 actual samples in memory;
 history resets when the panel restarts and grows while someone views it. Traffic,
 disk and process CPU rates need two samples. Missing counters are shown as unavailable
-rather than zero. These are read-only inspections; the page cannot stop processes,
-change services, or alter the firewall.
+rather than zero. Telemetry is read-only. The maintenance panel can back up the
+panel database and clean unused Docker build cache older than seven days. Project
+controls manage Docker Compose stacks; OS processes, systemd and firewall rules
+are not changed by these controls.
 
 In Windows development the page explicitly shows your **local Windows machine**,
 not the remote VPS. Linux installed directly on the VPS uses native procfs and
@@ -384,10 +447,9 @@ The CI matrix checks Linux and Windows using the documented
 An additional Linux job builds and verifies the production container with
 real Docker deployments.
 
-CI audits production dependencies with `npm audit --omit=dev`. The full
-development audit currently also reports an upstream `braces` pattern-parser
-advisory through the Next.js ESLint plugin; npm has no compatible patched
-release for that dependency. It is excluded from the production image.
+CI audits production dependencies with `npm audit --omit=dev`. Next.js and its
+ESLint configuration are pinned to 16.4.6. Check the full development audit
+separately; development-only tooling is excluded from the production image.
 
 `node test/deploy.mjs <baseUrl>` is an additional real-Docker check for an
 explicitly prepared `realapp` fixture: it expects a Git repo one commit behind

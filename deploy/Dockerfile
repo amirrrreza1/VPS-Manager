@@ -28,6 +28,7 @@ WORKDIR /app
 # through a supplementary group supplied with --group-add.
 RUN apk add --no-cache \
       git \
+      openssh-client \
       docker-cli \
       docker-cli-compose \
       tini \

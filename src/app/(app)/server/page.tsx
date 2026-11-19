@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { MaintenancePanel } from "./maintenance-panel";
 import type { ServerSnapshot } from "@/lib/server-types";
 import { useServerInfo } from "./use-server-info";
 import { bytes, percentage, sourceLabel, SummaryCards, uptime } from "./server-overview";
@@ -31,6 +32,7 @@ export default function ServerPage() {
   const services = data?.services.entries.filter((service) => `${service.name} ${service.description} ${service.state}`.toLowerCase().includes(serviceQuery.toLowerCase())) ?? [];
 
   return <div className="space-y-5">
+    <MaintenancePanel />
     <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-xl font-semibold">Server information</h1><p className="mt-1 text-sm text-zinc-500">Live resources, system details, networking and services.</p>{data && <p className="mt-2 text-xs text-zinc-500"><span className="mr-2 rounded bg-emerald-500/10 px-2 py-1 text-emerald-400">{sourceLabel(data)}</span>Updated {new Date(data.sampledAt).toLocaleTimeString()} · Refreshes every 10 seconds while visible</p>}</div><button onClick={refresh} disabled={refreshing} className="rounded-lg border border-zinc-700 px-3 py-2 text-xs text-zinc-300 disabled:opacity-40">{refreshing ? "Refreshing…" : "Refresh server"}</button></div>
     {error && <p role="alert" className="rounded-lg border border-red-900 bg-red-950/30 p-3 text-sm text-red-300">{error}{data && " The last successful snapshot is shown."}</p>}
     {!data ? <p role="status" className="rounded-xl border border-zinc-800 p-8 text-sm text-zinc-500">Reading server resources and available services…</p> : <>

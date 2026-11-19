@@ -8,16 +8,17 @@ import { resolveDir, resolveFile, resolveForWrite } from "./safe-path";
 import { db } from "./db";
 import { getProject } from "./projects";
 import { audit } from "./audit";
+import { lockProject } from "./project-lock";
 
 /**
  * Deploy pipeline.
  *
  * Default sequence (matching the requested flow):
  *   1. backup .env files        (so a bad deploy can be undone)
- *   2. docker compose down
+ *   2. validate the existing compose file
  *   3. git fetch --all --prune
  *   4. git reset --hard origin/<branch>   (or git pull --ff-only)
- *   5. docker compose up -d --build
+ *   5. preserve .env, validate, build, then docker compose up -d --no-build
  *   6. health check
  *
  * If a health check is configured and the new container is not healthy, we
@@ -105,6 +106,8 @@ export interface DeployOptions {
   autoRollback?: boolean;
   /** Back up and restore .env files around the deploy. */
   backupEnv?: boolean;
+  /** Required for unattended deployments; never discard server edits. */
+  requireClean?: boolean;
 }
 
 function emit(state: DeployState): void {
@@ -151,6 +154,8 @@ export function startDeploy(
   if (info.isGitRepo && (!branch || branch === "HEAD" || branch.startsWith("-") || !/^[A-Za-z0-9._/\-]+$/.test(branch))) {
     throw new Error("select a valid origin branch before deploying");
   }
+  if (opts.requireClean && info.dirty) throw new Error("automatic deployment refused: uncommitted changes");
+  const unlock = lockProject(absPath, "deployment");
   const id = crypto.randomUUID();
   let aborted = false;
 
@@ -194,6 +199,7 @@ export function startDeploy(
     const envBackups: { file: string; content: Buffer }[] = [];
     let success = false;
     let stackTouched = false;
+    let treeTouched = false;
     // Declared outside the try so the rollback path can use it too.
     const compose = info.composeFile ?? "docker-compose.yml";
 
@@ -220,18 +226,18 @@ export function startDeploy(
         finishStep(state, s, 0);
       }
 
-      // ---- 2. docker compose down ---------------------------------------
+      // Validate without logging resolved environment values. Keep the existing
+      // stack serving while fetching/building the candidate.
       checkAborted(aborted);
-      stackTouched = true;
-      const down = addStep(state, `docker compose down (${compose})`);
-      stepStarted.set(down, Date.now());
-      const downRes = await run(
+      const validation = addStep(state, "Validate Compose configuration");
+      const validationRes = await run(
         "docker",
-        ["compose", "-f", compose, "down"],
-        { cwd: absPath, timeoutMs: 180_000, onOutput: (c) => appendOutput(state, down, c) },
+        ["compose", "-f", compose, "config", "--quiet"],
+        { cwd: absPath, timeoutMs: 30_000 },
       );
-      finishStep(state, down, downRes.code);
-      if (downRes.code !== 0) throw new Error(`docker compose down failed: ${downRes.stderr}`);
+      finishStep(state, validation, validationRes.code);
+      if (validationRes.code !== 0) throw new Error("Compose configuration invalid; check environment variables and compose files");
+      checkAborted(aborted);
 
       // ---- 3. git fetch ---------------------------------------------------
       const gitAvailable = info.isGitRepo;
@@ -246,6 +252,7 @@ export function startDeploy(
         });
         finishStep(state, fetch, fetchRes.code);
         if (fetchRes.code !== 0) throw new Error(`git fetch failed: ${fetchRes.stderr}`);
+        if (opts.requireClean && getProject(absPath).dirty) throw new Error("automatic deployment refused: files changed during Git fetch");
 
         // ---- 4. update working tree --------------------------------------
         checkAborted(aborted);
@@ -269,6 +276,9 @@ export function startDeploy(
             ? ["reset", "--hard", target]
             : ["reset", "--hard", "HEAD"];
 
+        // A refused fast-forward pull must not trigger a hard reset that could
+        // discard edits made while fetch was running.
+        if (!opts.usePull) treeTouched = true;
         const updateRes = await run("git", updateArgs, {
           cwd: absPath,
           timeoutMs: 120_000,
@@ -276,6 +286,7 @@ export function startDeploy(
         });
         finishStep(state, update, updateRes.code);
         if (updateRes.code !== 0) throw new Error(`git update failed: ${updateRes.stderr}`);
+        treeTouched = true;
 
         const after = getProject(absPath);
         state.commitAfter = after.commit;
@@ -288,10 +299,28 @@ export function startDeploy(
 
       checkAborted(aborted);
 
+      // Git may track environment files: preserve the operator's version on
+      // successful deployments too, before interpolation/building takes place.
+      for (const backup of envBackups) fs.writeFileSync(resolveForWrite(backup.file), backup.content, { mode: 0o600 });
+
+      const candidate = addStep(state, "Validate candidate Compose configuration");
+      const candidateRes = await run("docker", ["compose", "-f", compose, "config", "--quiet"], { cwd: absPath, timeoutMs: 30_000 });
+      finishStep(state, candidate, candidateRes.code);
+      if (candidateRes.code !== 0) throw new Error("Candidate Compose configuration invalid; current containers remain running");
+
+      if (opts.build !== false) {
+        const build = addStep(state, "Build candidate images (current containers stay running)");
+        const built = await run("docker", ["compose", "-f", compose, "build"], { cwd: absPath, timeoutMs: 20 * 60_000, onOutput: (c) => appendOutput(state, build, c) });
+        finishStep(state, build, built.code);
+        if (built.code !== 0) throw new Error(`docker compose build failed: ${built.stderr}`);
+      }
+      checkAborted(aborted);
+
       // ---- 5. docker compose up -----------------------------------------
       const upArgs = ["compose", "-f", compose, "up", "-d"];
-      if (opts.build !== false) upArgs.push("--build");
-      const up = addStep(state, `docker compose up -d${opts.build !== false ? " --build" : ""}`);
+      upArgs.push("--no-build");
+      const up = addStep(state, "Apply candidate containers");
+      stackTouched = true;
       stepStarted.set(up, Date.now());
       const upRes = await run("docker", upArgs, {
         cwd: absPath,
@@ -328,9 +357,9 @@ export function startDeploy(
       for (const step of state.steps) if (step.status === "running") finishStep(state, step, 1);
 
       if (aborted) {
-        if (opts.autoRollback && stackTouched) {
+        if (opts.autoRollback && (stackTouched || treeTouched)) {
           const restore = addStep(state, "Restore previous version after abort");
-          const restored = await rollback(state, restore, absPath, compose, envBackups, opts);
+          const restored = await rollback(state, restore, absPath, compose, envBackups, opts, stackTouched);
           finishStep(state, restore, restored ? 0 : 1);
           if (!restored) state.error += "; restoring the previous stack failed";
         }
@@ -342,10 +371,10 @@ export function startDeploy(
         return state;
       }
 
-      if (opts.autoRollback && stackTouched) {
+      if (opts.autoRollback && (stackTouched || treeTouched)) {
         const rb = addStep(state, "Roll back to previous version");
         stepStarted.set(rb, Date.now());
-        const ok = await rollback(state, rb, absPath, compose, envBackups, opts);
+        const ok = await rollback(state, rb, absPath, compose, envBackups, opts, stackTouched);
         if (ok) {
           finishStep(state, rb, 0);
           state.status = "rolled_back";
@@ -406,6 +435,7 @@ export function startDeploy(
   };
   handles.set(id, handle);
   void promise.finally(() => {
+    unlock();
     handles.delete(id);
     // Retain a bounded set of completed deployments for stream reconnects.
     const completed = [...inflight.values()].filter((d) => !["queued", "running"].includes(d.status));
@@ -514,9 +544,14 @@ async function rollback(
   composeFile: string,
   envBackups: { file: string; content: Buffer }[],
   opts: DeployOptions,
+  restoreStack = true,
 ): Promise<boolean> {
   const onOut = (c: string) => appendOutput(state, step, c);
   try {
+    if (opts.requireClean && getProject(absPath).dirty) {
+      onOut("Automatic rollback refused because files changed during deployment. Server edits were preserved; inspect the stack and deploy manually.\n");
+      return false;
+    }
     if (state.commitBefore) {
       const r = await run("git", ["reset", "--hard", state.commitBefore], {
         cwd: absPath,
@@ -536,11 +571,19 @@ async function rollback(
       onOut(`restored ${path.basename(b.file)}\n`);
     }
 
+    if (!restoreStack) {
+      onOut("previous files restored; current containers were left running\n");
+      return true;
+    }
     const upArgs = ["compose", "-f", composeFile, "up", "-d"];
     if (opts.build !== false) upArgs.push("--build");
     const up = await run("docker", upArgs, { cwd: absPath, timeoutMs: 20 * 60_000, onOutput: onOut });
     if (up.code !== 0) {
       onOut(`rollback compose up failed: ${up.stderr}\n`);
+      return false;
+    }
+    if ((opts.healthTimeoutSec ?? 0) > 0 && !await waitForHealthy(absPath, composeFile, opts.healthTimeoutSec!, () => false, onOut)) {
+      onOut("rollback containers did not recover before the health timeout\n");
       return false;
     }
     onOut("previous version restored and running\n");

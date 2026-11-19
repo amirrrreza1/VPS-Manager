@@ -128,6 +128,31 @@ let projects = [];
 }
 
 console.log("\nServer telemetry");
+console.log("\nProject creation and automation API");
+{
+  const discovery = await (await call("/api/projects")).json();
+  const root = discovery.roots?.[0];
+  ok("configured project roots are available for creation", typeof root === "string");
+  for (const endpoint of ["/api/automation", "/api/server/maintenance"]) {
+    ok(`${endpoint} rejects unauthenticated access`, (await fetch(`${BASE}${endpoint}`)).status === 401);
+  }
+  const crossOrigin = await call("/api/projects", { method: "POST", headers: { Origin: "https://evil.example" }, json: { name: "invalid", root, template: "static" } });
+  ok("project creation rejects cross-origin requests", crossOrigin.status === 403);
+  const created = await call("/api/projects", { method: "POST", json: { name: "smoke-static", root, template: "static", hostPort: 18088 } });
+  const project = (await created.json()).project;
+  ok("static project created through authenticated API", created.status === 201 && project?.composeFile === "compose.yaml");
+  ok("duplicate project creation is refused", (await call("/api/projects", { method: "POST", json: { name: "smoke-static", root, template: "static" } })).status === 400);
+  ok("invalid project name is refused", (await call("/api/projects", { method: "POST", json: { name: "../outside", root, template: "static" } })).status === 400);
+  ok("auto deploy requires a Git origin", (await call("/api/automation", { method: "PUT", json: { project: project?.path, enabled: true, intervalSec: 60 } })).status === 400);
+  ok("unknown stack commands are rejected", (await call("/api/docker", { method: "POST", json: { project: project?.path, action: "exec" } })).status === 400);
+  const snapshot = await call("/api/server/maintenance", { method: "POST", json: { action: "backup" } });
+  ok("authenticated online database backup succeeds", snapshot.status === 200 && (await snapshot.json()).output?.includes("snapshot saved"));
+  ok("database snapshots cannot be accessed through file API", (await call("/api/files?path=/../data/backups")).status >= 400);
+  const rules = await (await call("/api/automation")).json();
+  ok("automatic deployment is opt-in for existing projects", Array.isArray(rules.rules) && rules.rules.every((rule) => !rule.enabled));
+  if (project) ok("temporary project cleanup succeeds", (await call("/api/files/mutate", { method: "POST", json: { op: "delete", path: project.path } })).status === 200);
+}
+
 {
   const response = await call("/api/server");
   const server = await response.json();
@@ -367,7 +392,7 @@ console.log("\nAccount security and file operations");
   const tail = await call(movieUrl, { headers: { Range: "bytes=-25" } });
   ok("video suffix ranges work", tail.status === 206 && Buffer.from(await tail.arrayBuffer()).equals(movie.subarray(-25)));
   const metadata = await call(movieUrl, { method: "HEAD" });
-  ok("video HEAD returns size and range support without bytes", metadata.status === 200 && metadata.headers.get("content-length") === "16384" && metadata.headers.get("accept-ranges") === "bytes" && (await metadata.arrayBuffer()).byteLength === 0);
+  ok("video HEAD reports size and range support without bytes", metadata.status === 200 && metadata.headers.get("x-file-size") === "16384" && metadata.headers.get("accept-ranges") === "bytes" && (await metadata.arrayBuffer()).byteLength === 0, JSON.stringify({ status: metadata.status, size: metadata.headers.get("x-file-size"), ranges: metadata.headers.get("accept-ranges") }));
   const invalidRange = await call(movieUrl, { headers: { Range: "bytes=99999-" } });
   ok("unsatisfiable video ranges are rejected", invalidRange.status === 416 && invalidRange.headers.get("content-range") === "bytes */16384");
   await call("/api/files/upload?dir=%2F%40personal&name=fake-image.png", { method: "POST", body: '<html><script>alert(1)</script></html>' });

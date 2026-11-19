@@ -14,7 +14,7 @@ import path from "node:path";
 export async function resolve(specifier, context, nextResolve) {
   // Substitute only Docker execution in pipeline tests. Git inspection and
   // updates still use real disposable repositories and the real runner.
-  if (process.env.VPM_TEST_FAKE_EXEC === "1" && specifier === "./exec" && context.parentURL?.endsWith("/src/lib/deploy.ts")) {
+  if (process.env.VPM_TEST_FAKE_EXEC === "1" && specifier === "./exec" && ["deploy.ts", "stack-control.ts", "automation.ts", "provision.ts"].some((name) => context.parentURL?.endsWith(`/src/lib/${name}`))) {
     return { url: new URL("./fake-exec.mjs", import.meta.url).href, shortCircuit: true };
   }
   // "server-only" is a build-time marker Next.js resolves; it does not exist

@@ -35,6 +35,9 @@ export function fileResponse(file: ReturnType<typeof openDownload>, options: Str
       "Content-Type": options.mimeType ?? "application/octet-stream",
       "Content-Disposition": `${options.inline ? "inline" : "attachment"}; filename*=UTF-8''${filename}`,
       "Content-Length": String(size),
+      // Next.js 16.4 filters Content-Length when forwarding route responses.
+      // Preserve explicit size metadata for authenticated HEAD inspections.
+      "X-File-Size": String(size),
       "Cache-Control": "private, no-store, max-age=0",
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",

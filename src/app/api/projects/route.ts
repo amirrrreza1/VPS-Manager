@@ -7,6 +7,7 @@ import { PathError } from "@/lib/safe-path";
 import { envRoots } from "@/lib/roots";
 import os from "node:os";
 import path from "node:path";
+import { provisionProject, type ProvisionOptions } from "@/lib/provision";
 
 export async function GET(req: Request) {
   const auth = await requireAuth(req, "projects.list");
@@ -31,6 +32,7 @@ export async function GET(req: Request) {
     const projects = discoverProjects();
     return NextResponse.json({
       projects,
+      roots: envRoots(),
       active: listActiveDeploys().map((d) => ({ id: d.id, project: d.project, path: d.absPath, status: d.status })),
       history: deployHistory(10),
       capabilities: {
@@ -50,4 +52,18 @@ export async function GET(req: Request) {
     if (err instanceof PathError) return fail(err.message, err.status);
     return fail((err as Error).message, 500);
   }
+}
+
+export async function POST(req: Request) {
+  const auth = await requireAuth(req, "project.create");
+  if ("response" in auth) return auth.response;
+  const body = await req.json().catch(() => null);
+  if (!body || typeof body.name !== "string" || typeof body.root !== "string" || typeof body.template !== "string") return fail("name, root and template are required");
+  for (const field of ["repository", "branch", "image"]) {
+    if (body[field] !== undefined && typeof body[field] !== "string") return fail(`invalid ${field}`);
+  }
+  try {
+    const project = await provisionProject(body as ProvisionOptions, { user: auth.user.username, ip: auth.meta.ip });
+    return NextResponse.json({ ok: true, project }, { status: 201 });
+  } catch (error) { return fail((error as Error).message, error instanceof PathError ? error.status : 400); }
 }

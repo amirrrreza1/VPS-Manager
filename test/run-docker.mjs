@@ -24,6 +24,7 @@ let server;
 let serverOutput = "";
 let base;
 let passed = 0;
+const extraStacks = [];
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const command = (bin, args, cwd = temporary) => execFileSync(bin, args, {
   cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
@@ -183,7 +184,7 @@ try {
   commit("broken-build", { broken: true }); git(seed, "push", "origin", "main");
   const failed = await waitForDeploy(await deploy());
   check("failed Docker build rolls back Git and reports the failure", () => {
-    assert.equal(failed.status, "rolled_back", JSON.stringify(failed)); assert.match(failed.error, /compose up failed/);
+    assert.equal(failed.status, "rolled_back", JSON.stringify(failed)); assert.match(failed.error, /compose build failed/);
     assert.equal(git(project, "rev-parse", "HEAD"), after);
   });
   await assertRunning("version-two"); passed++; console.log("PASS failed build restores the previous healthy container");
@@ -208,6 +209,51 @@ try {
   const completed = await waitForDeploy(await deploy());
   check("another deployment succeeds after an abort", () => assert.equal(completed.status, "succeeded", JSON.stringify(completed)));
   await assertRunning("version-three");
+  const automatic = await call("/api/automation", { method: "PUT", json: { project: "/realapp", enabled: true, intervalSec: 60 } });
+  assert.equal(automatic.status, 200);
+  commit("version-four-automatic"); git(seed, "push", "origin", "main");
+  let autoId;
+  const autoDeadline = Date.now() + 90_000;
+  while (Date.now() < autoDeadline) {
+    const rules = await (await call("/api/automation")).json();
+    autoId = rules.rules.find((rule) => rule.path === project)?.deploy_id;
+    if (autoId) break;
+    await delay(1000);
+  }
+  assert.ok(autoId, "background worker should deploy with no dashboard open");
+  const autoResult = await waitForDeploy(autoId);
+  check("background Git polling deploys a new commit with no open browser", () => assert.equal(autoResult.status, "succeeded", JSON.stringify(autoResult)));
+  await assertRunning("version-four-automatic");
+  for (const action of ["stop", "start", "restart"]) {
+    const controlled = await call("/api/docker", { method: "POST", json: { project: "/realapp", action }, signal: AbortSignal.timeout(210_000) });
+    check(`real stack ${action} succeeds`, () => assert.equal(controlled.status, 200));
+    const rules = await (await call("/api/automation")).json();
+    assert.equal(rules.rules.find((rule) => rule.path === project)?.enabled, 0);
+  }
+  await assertRunning("version-four-automatic");
+  for (const template of ["static", "image", "postgres", "redis"]) {
+    const projectName = `fixture-${template}-${name.slice(-8)}`;
+    const response = await call("/api/projects", { method: "POST", json: { root, name: projectName, template, hostPort: 49152 + Math.floor(Math.random() * 15000), ...(template === "image" ? { image: "nginx:stable-alpine", containerPort: 80 } : {}) } });
+    const created = await response.json();
+    assert.equal(response.status, 201, JSON.stringify(created));
+    const fixturePath = path.join(root, projectName);
+    const fixtureCompose = (...args) => command("docker", ["compose", "-f", "compose.yaml", ...args], fixturePath);
+    extraStacks.push(fixtureCompose);
+    fixtureCompose("config", "--quiet");
+    check(`${template} template generates valid real Compose configuration`, () => assert.ok(created.project.composeFile));
+    if (["static", "postgres", "redis"].includes(template)) {
+      const deployed = await call("/api/deploy", { method: "POST", json: { project: created.project.path, autoRollback: true, healthTimeoutSec: 30 } });
+      const deployment = await deployed.json();
+      assert.equal(deployed.status, 200);
+      const state = await waitForDeploy(deployment.id);
+      assert.equal(state.status, "succeeded", JSON.stringify(state));
+      const container = fixtureCompose("ps", "-q", template === "postgres" ? "db" : template === "redis" ? "cache" : "app");
+      if (template === "static") check("new static project deploys and serves its generated website", () => assert.ok(command("docker", ["exec", container, "wget", "-qO-", "http://127.0.0.1"]).includes(projectName)));
+      if (template === "postgres") check("new PostgreSQL database deploys and accepts connections", () => assert.match(command("docker", ["exec", container, "pg_isready", "-U", "app", "-d", "app"]), /accepting connections/));
+      if (template === "redis") check("new Redis cache deploys and accepts authenticated connections", () => assert.equal(command("docker", ["exec", container, "sh", "-c", 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping']), "PONG"));
+      fixtureCompose("down", "--volumes", "--rmi", "local");
+    }
+  }
   await stopServer();
   const database = new DatabaseSync(path.join(data, "vpm.db"));
   database.prepare("INSERT INTO deploys (id, project, branch, status, started_at, abs_path) VALUES (?, ?, ?, 'running', ?, ?)").run("interrupted-test", "realapp", "main", Date.now(), project);
@@ -224,6 +270,10 @@ try {
 } finally {
   streamAbort.abort();
   await stopServer();
+  for (const fixtureCompose of extraStacks) {
+    try { fixtureCompose("down", "--volumes", "--rmi", "local"); }
+    catch (error) { console.error("Template fixture cleanup failed:", error.message); process.exitCode = 1; }
+  }
   if (fs.existsSync(path.join(project, "docker-compose.yml"))) {
     try { compose("down", "--volumes", "--remove-orphans"); } catch (error) { console.error("Fixture container cleanup failed:", error.message); process.exitCode = 1; }
   }

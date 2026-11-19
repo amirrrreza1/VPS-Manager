@@ -74,6 +74,17 @@ export function db(): DatabaseSync {
     );
     CREATE INDEX IF NOT EXISTS idx_deploys_started ON deploys(started_at DESC);
 
+    CREATE TABLE IF NOT EXISTS project_automation (
+      path TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 0,
+      interval_sec INTEGER NOT NULL DEFAULT 300,
+      checked_at INTEGER,
+      next_check_at INTEGER NOT NULL DEFAULT 0,
+      attempted_commit TEXT,
+      deploy_id TEXT,
+      error TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS settings (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL

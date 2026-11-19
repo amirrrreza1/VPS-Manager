@@ -22,6 +22,8 @@ services:
       VPM_DATA_DIR: /data
       VPM_FILES_DIR: /data/files
       VPM_MAX_UPLOAD_BYTES: ${VPM_MAX_UPLOAD_BYTES:-1073741824}
+      VPM_AUTOMATION: ${VPM_AUTOMATION:-1}
+      VPM_AUTO_BACKUP: ${VPM_AUTO_BACKUP:-1}
       VPM_HOST_PROC: /host/proc
       VPM_HOST_SYS: /host/sys
       VPM_HOST_OS_RELEASE: /host/os-release

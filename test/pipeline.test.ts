@@ -91,10 +91,48 @@ try {
   assert.equal(abortDeploy(aborted.id), true);
   const abortedState = await aborted.promise;
   assert.equal(abortedState.status, "aborted");
-  assert.equal(abortedState.steps.at(-1)?.label, "Restore previous version after abort");
+  assert.equal(abortedState.steps.at(-1)?.label, "Validate Compose configuration");
   assert.equal(abortedState.steps.at(-1)?.status, "ok");
-  assert.equal(calls.filter((call: { cwd: string; args: string[] }) => call.cwd === abortDir && call.args.includes("up")).length, 1);
-  passed++; console.log("PASS cooperative abort stops the pipeline and restores the previous stack");
+  assert.equal(calls.filter((call: { cwd: string; args: string[] }) => call.cwd === abortDir && call.args.includes("up")).length, 0);
+  passed++; console.log("PASS cooperative abort before update leaves the running stack untouched");
+
+  const failedBuild = fixture("build-fails");
+  const failedState = await startDeploy(failedBuild, { autoRollback: true }).promise;
+  assert.equal(failedState.status, "failed");
+  assert.equal(calls.some((call: { cwd: string; args: string[] }) => call.cwd === failedBuild && (call.args.includes("down") || call.args.includes("up"))), false);
+  passed++; console.log("PASS failed candidate build never stops or replaces existing containers");
+
+  fs.writeFileSync(path.join(rollbackDir, ".env"), "TOKEN=operator-value\n");
+  const preserved = await startDeploy(rollbackDir).promise;
+  assert.equal(preserved.status, "succeeded");
+  assert.equal(fs.readFileSync(path.join(rollbackDir, ".env"), "utf8"), "TOKEN=operator-value\n");
+  assert.equal(calls.some((call: { args: string[] }) => call.args.includes("down")), false);
+  passed++; console.log("PASS successful deployment preserves operator environment and uses no compose down");
+
+  // A Git edit racing an automatic pull must never be discarded by rollback.
+  const editDuringPull = (state: { absPath: string; steps: { label: string }[] }) => {
+    if (state.absPath === rollbackDir && state.steps.at(-1)?.label.startsWith("git pull")) fs.writeFileSync(path.join(rollbackDir, ".env"), "TOKEN=concurrent-operator-edit\n");
+  };
+  git(rollbackDir, "reset", "--hard", before);
+  deployEvents.on("update", editDuringPull);
+  const refusedPull = await startDeploy(rollbackDir, { usePull: true, requireClean: true, autoRollback: true }).promise;
+  deployEvents.off("update", editDuringPull);
+  assert.equal(refusedPull.status, "failed");
+  assert.equal(fs.readFileSync(path.join(rollbackDir, ".env"), "utf8"), "TOKEN=concurrent-operator-edit\n");
+  passed++; console.log("PASS refused automatic pull preserves edits made during fetch instead of hard-resetting them");
+
+  git(rollbackDir, "reset", "--hard", before);
+  const editDuringBuild = (state: { absPath: string; steps: { label: string }[] }) => {
+    if (state.absPath === rollbackDir && state.steps.at(-1)?.label.startsWith("Health check")) fs.writeFileSync(path.join(rollbackDir, "operator.txt"), "keep this edit\n");
+  };
+  healthScenarios.set(rollbackDir, { states: [{ Service: "app", State: "exited", ExitCode: 1 }] });
+  deployEvents.on("update", editDuringBuild);
+  const guardedRollback = await startDeploy(rollbackDir, { usePull: true, requireClean: true, autoRollback: true, healthTimeoutSec: 1 }).promise;
+  deployEvents.off("update", editDuringBuild);
+  assert.equal(guardedRollback.status, "failed");
+  assert.match(guardedRollback.steps.at(-1)?.output ?? "", /rollback refused/);
+  assert.equal(fs.readFileSync(path.join(rollbackDir, "operator.txt"), "utf8"), "keep this edit\n");
+  passed++; console.log("PASS automatic rollback refuses to discard edits made during a deployment");
 
   let liveChunk = false;
   const listener = (state: { steps: { output: string; status: string }[] }) => {
