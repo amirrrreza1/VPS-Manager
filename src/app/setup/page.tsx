@@ -1,4 +1,5 @@
 "use client";
+import { BrandIcon } from "@/components/brand-icon";
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
@@ -41,6 +42,7 @@ export default function SetupPage() {
   return (
     <main className="flex-1 flex items-center justify-center p-6">
       <div className="w-full max-w-sm">
+        <BrandIcon size={56} className="mx-auto mb-3" />
         <h1 className="mb-6 text-center text-xl font-semibold">First-run setup</h1>
         <form
           onSubmit={submit}

@@ -1,4 +1,5 @@
 "use client";
+import { BrandIcon } from "@/components/brand-icon";
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
@@ -68,9 +69,7 @@ export default function LoginPage() {
     <main className="flex-1 flex items-center justify-center p-6">
       <div className="w-full max-w-sm">
         <div className="mb-8 text-center">
-          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-500/10 text-xl">
-            ⬢
-          </div>
+          <BrandIcon size={56} className="mx-auto mb-3" />
           <h1 className="text-xl font-semibold">VPS Manager</h1>
           <p className="mt-1 text-sm text-zinc-500">
             {needsTotp ? "Enter your authenticator or recovery code" : "Sign in to continue"}

@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
+import { BrandIcon } from "@/components/brand-icon";
 
 const NAV = [
   { href: "/dashboard", label: "Projects" },
@@ -25,8 +26,8 @@ export default function Shell({ children, username }: { children: React.ReactNod
     <div className="flex min-h-screen flex-col">
       <header className="sticky top-0 z-10 border-b border-zinc-800 bg-zinc-950/90 backdrop-blur">
         <div className="mx-auto flex min-h-14 max-w-7xl flex-wrap items-center gap-2 px-4 py-2 sm:gap-6">
-          <Link href="/dashboard" className="flex items-center gap-2 font-semibold">
-            <span className="text-emerald-500">⬢</span>
+          <Link href="/dashboard" aria-label="VPS Manager" className="flex items-center gap-2 font-semibold">
+            <BrandIcon size={28} className="shrink-0" />
             <span className="hidden sm:inline">VPS Manager</span>
           </Link>
 
